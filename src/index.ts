@@ -43,7 +43,6 @@ const llm = new ChatOpenAI({
   apiKey: "dummy",
 });
 
-// 🌟 移除了 user_context，保持乾淨
 const AgentState = Annotation.Root({
   ...MessagesAnnotation.spec,
   user_id: Annotation<string>(),
@@ -55,8 +54,6 @@ const callModel = async (state: typeof AgentState.State) => {
   const skillsIndex = fs.existsSync(INDEX_FILE) ? fs.readFileSync(INDEX_FILE, 'utf-8') : '';
   const nutritionRules = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf-8') : '';
 
-  // 🌟 關鍵修復：把 user_id 和 room_id 都明確告訴 AI！
-  // 否則它在呼叫 logDietTool 時，會因為不知道 room_id 而失敗！
   const userInfo = state.user_id ? `目前服務的使用者 ID (user_id): ${state.user_id}` : '目前使用者: 訪客 (無 user_id)';
   const roomInfo = state.room_id ? `目前的對話群組 ID (room_id): ${state.room_id}` : '';
 
@@ -109,9 +106,28 @@ const sendSSE = (res: Response, data: object) => {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 };
 
+const getChunkText = (content: unknown): string => {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (
+        part &&
+        typeof part === "object" &&
+        "text" in part &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        return (part as { text: string }).text;
+      }
+      return "";
+    })
+    .join("");
+};
+
 // --- API Router ---
 app.post('/api/chat', async (req: Request, res: Response) => {
-  // 🌟 這裡修正了：乾淨的解構，不再依賴前端的 user_context
   const { message, thread_id, user_id } = req.body;
   if (!thread_id) return res.status(400).send("Missing thread_id");
 
@@ -126,7 +142,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       const stream = agentApp.streamEvents(input, { ...config, version: "v2" });
       for await (const event of stream) {
         if (event.event === "on_chat_model_stream") {
-          const content = event.data.chunk?.content;
+          const content = getChunkText(event.data.chunk?.content);
           if (content) sendSSE(res, { type: "text", content });
         } else if (event.event === "on_tool_start") {
           sendSSE(res, { type: "status", content: `AI 正在執行工具: ${event.name}...` });
@@ -162,6 +178,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
         break;
       } else {
         sendSSE(res, { type: "status", content: "AI 正在思考中..." });
+        await agentApp.updateState(config, null);
         await runAgentStream(null);
         state = await agentApp.getState(config);
       }
