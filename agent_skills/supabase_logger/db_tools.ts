@@ -21,10 +21,6 @@ export const logDietTool = tool(
   }) => {
     try {
       const summaryColumnEnabled = process.env.ENABLE_SUMMARY_COLUMN === "true";
-      const looksLikeSummaryText =
-        typeof ai_analysis_report === "string" &&
-        /總結|摘要|summary/i.test(ai_analysis_report) &&
-        (diet_report === null || diet_report === undefined);
 
       if (record_type === "summary") {
         if (!summaryColumnEnabled) {
@@ -54,9 +50,6 @@ export const logDietTool = tool(
         return "✅ 摘要已寫入 summary 欄位。";
       }
 
-      if (looksLikeSummaryText) {
-        return "⚠️ 偵測到摘要內容且無營養數據，已阻擋寫入 ai_analysis_report。";
-      }
       if (!ai_analysis_report) {
         return "⚠️ 缺少 ai_analysis_report，已取消寫入。";
       }

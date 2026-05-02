@@ -39,7 +39,6 @@ const agentTools = [
   visionAnalyzerTool,
   calculateNutritionTool,
   getChatHistoryTool,
-  getUserProfileTool,
   updateUserProfileTool
 ];
 const toolNode = new ToolNode(agentTools);
@@ -55,6 +54,7 @@ const AgentState = Annotation.Root({
   ...MessagesAnnotation.spec,
   user_id: Annotation<string>(),
   room_id: Annotation<string>(),
+  user_profile_context: Annotation<string>(),
 });
 
 const callModel = async (state: typeof AgentState.State) => {
@@ -64,6 +64,7 @@ const callModel = async (state: typeof AgentState.State) => {
 
   const userInfo = state.user_id ? `目前服務的使用者 ID (user_id): ${state.user_id}` : '目前使用者: 訪客 (無 user_id)';
   const roomInfo = state.room_id ? `目前的對話群組 ID (room_id): ${state.room_id}` : '';
+  const userProfileContext = state.user_profile_context || "尚未載入使用者資料";
 
   const prompt = `
   ${agentInstructions}
@@ -77,6 +78,15 @@ const callModel = async (state: typeof AgentState.State) => {
 
   --- 目前的營養學指導原則 (知識庫) ---
   ${nutritionRules}
+
+  --- 使用者檔案 (後端強制載入，請優先依據此資訊回覆) ---
+  ${userProfileContext}
+
+  --- 個人化回覆規則 ---
+  1) 若有 nickname，請優先以 nickname 稱呼使用者。
+  2) 若有身高/體重/年齡/性別，請把建議明確客製化。
+  3) 若有 taboo/disease，請避免推薦衝突食物並主動提醒風險。
+  4) 若欄位缺漏，先說明「目前缺少哪些資料」，再給保守建議。
   `;
 
 
@@ -205,7 +215,9 @@ const persistRecord = async (
       record_type: "summary" as const,
       summary_text: record.summary_text || record.ai_analysis_report || "",
     };
-    return logDietTool.invoke(summaryPayload);
+    const result = await logDietTool.invoke(summaryPayload);
+    console.log("[persistRecord] summary result:", result);
+    return result;
   }
 
   const chatPayload = {
@@ -217,7 +229,57 @@ const persistRecord = async (
     diet_report: record.diet_report ?? null,
     record_type: "chat" as const,
   };
-  return logDietTool.invoke(chatPayload);
+  const result = await logDietTool.invoke(chatPayload);
+  console.log("[persistRecord] chat result:", result);
+  return result;
+};
+
+const formatUserProfileContext = (raw: string, userId?: string): string => {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const nickname = typeof parsed.nickname === "string" && parsed.nickname.trim().length > 0
+      ? parsed.nickname.trim()
+      : "未提供";
+    const height = parsed.height ?? "未提供";
+    const weight = parsed.weight ?? "未提供";
+    const age = parsed.age ?? "未提供";
+    const gender = parsed.gender ?? "未提供";
+    const taboo = Array.isArray(parsed.taboo) ? parsed.taboo.join(", ") || "無" : "未提供";
+    const disease = Array.isArray(parsed.disease) ? parsed.disease.join(", ") || "無" : "未提供";
+
+    return [
+      `user_id: ${userId || "未提供"}`,
+      `nickname: ${nickname}`,
+      `height: ${height}`,
+      `weight: ${weight}`,
+      `age: ${age}`,
+      `gender: ${gender}`,
+      `taboo: ${taboo}`,
+      `disease: ${disease}`,
+    ].join("\n");
+  } catch {
+    return `user_id: ${userId || "未提供"}\nprofile_raw: ${raw}`;
+  }
+};
+
+const fetchUserProfileContext = async (userId?: string): Promise<string> => {
+  if (!userId) {
+    return "未提供 user_id，無法載入個人資料。請使用中性稱呼並先詢問基本資料。";
+  }
+
+  try {
+    const result = await getUserProfileTool.invoke({ user_id: userId });
+    if (typeof result !== "string") {
+      return `user_id: ${userId}\n載入結果格式非字串，請保守回覆。`;
+    }
+    if (result.includes("讀取使用者資料失敗")) {
+      return `user_id: ${userId}\n查無完整個人資料，請先詢問暱稱、身高、體重。`;
+    }
+    return formatUserProfileContext(result, userId);
+  } catch (error) {
+    console.error("Fetch profile failed:", error);
+    return `user_id: ${userId}\n載入個人資料時發生錯誤，請先詢問關鍵資訊後再客製化。`;
+  }
 };
 
 // --- API Router ---
@@ -234,6 +296,9 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   const config = { configurable: { thread_id } };
 
   try {
+    sendSSE(res, { type: "status", content: "AI 正在載入使用者資料..." });
+    const userProfileContext = await fetchUserProfileContext(normalizedUserId);
+
     const runAgentStream = async (input: any) => {
       const stream = agentApp.streamEvents(input, { ...config, version: "v2" });
       const textByMessageId = new Map<string, string>();
@@ -248,10 +313,21 @@ app.post('/api/chat', async (req: Request, res: Response) => {
           const chunkId = event.data.chunk?.id;
           if (typeof chunkId === "string" && chunkId.length > 0) {
             const prev = textByMessageId.get(chunkId) || "";
-            textByMessageId.set(chunkId, `${prev}${content}`);
+            // Handle both delta chunks ("你", "好") and cumulative chunks ("你", "你好")
+            const next = content.startsWith(prev) ? content : `${prev}${content}`;
+            const delta = next.slice(prev.length);
+            textByMessageId.set(chunkId, next);
             latestMessageId = chunkId;
+            if (delta) {
+              sendSSE(res, { type: "text", content: delta });
+            }
           } else {
-            fallbackText += content;
+            const next = content.startsWith(fallbackText) ? content : `${fallbackText}${content}`;
+            const delta = next.slice(fallbackText.length);
+            fallbackText = next;
+            if (delta) {
+              sendSSE(res, { type: "text", content: delta });
+            }
           }
         } else if (event.event === "on_tool_start") {
           sendSSE(res, { type: "status", content: `AI 正在執行工具: ${event.name}...` });
@@ -267,21 +343,28 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     const finalVisibleText = await runAgentStream({
       messages: [{ role: "user", content: message }],
       user_id: normalizedUserId || "guest_user",
-      room_id: thread_id
+      room_id: thread_id,
+      user_profile_context: userProfileContext,
     });
-
-    if (finalVisibleText) {
-      sendSSE(res, { type: "text", content: finalVisibleText });
-      const record = await extractPersistRecord(message, finalVisibleText);
-      await persistRecord(record, {
-        thread_id,
-        user_id: normalizedUserId,
-        user_message: message
-      });
-    }
 
     sendSSE(res, { type: "done" });
     res.end();
+
+    if (finalVisibleText) {
+      void (async () => {
+        try {
+          const record = await extractPersistRecord(message, finalVisibleText);
+          console.log("[persistRecord] extracted record_type:", record.record_type);
+          await persistRecord(record, {
+            thread_id,
+            user_id: normalizedUserId,
+            user_message: message
+          });
+        } catch (persistError) {
+          console.error("Background persistence failed:", persistError);
+        }
+      })();
+    }
 
   } catch (error) {
     console.error("Agent Error:", error);
