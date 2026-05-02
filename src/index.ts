@@ -4,10 +4,10 @@ import type { Request, Response } from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import { z } from 'zod';
 import { ChatOpenAI } from '@langchain/openai';
 import { MemorySaver, StateGraph, START, END, MessagesAnnotation, Annotation } from '@langchain/langgraph';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
-import { AIMessage } from '@langchain/core/messages';
 
 import { readKnowledgeTool, updateKnowledgeTool } from '../agent_skills/admin_knowledge/file_tools';
 import { visionAnalyzerTool } from '../agent_skills/vision_analyzer/vision_model';
@@ -32,9 +32,17 @@ app.use('/images', express.static(USERS_IMAGES_DIR));
 const PORT = Number(process.env.PORT) || 8001;
 const AI_API_URL = process.env.AI_API_URL || "http://localhost:8080/v1";
 
-// 引入工具
-const tools = [readKnowledgeTool, updateKnowledgeTool, visionAnalyzerTool, calculateNutritionTool, logDietTool, getChatHistoryTool, getUserProfileTool, updateUserProfileTool];
-const toolNode = new ToolNode(tools);
+// Agent 可用工具（不包含直接寫 DB 的 log_diet_history）
+const agentTools = [
+  readKnowledgeTool,
+  updateKnowledgeTool,
+  visionAnalyzerTool,
+  calculateNutritionTool,
+  getChatHistoryTool,
+  getUserProfileTool,
+  updateUserProfileTool
+];
+const toolNode = new ToolNode(agentTools);
 
 const llm = new ChatOpenAI({
   modelName: "gemma",
@@ -80,7 +88,7 @@ const callModel = async (state: typeof AgentState.State) => {
   if (state.messages.length > MAX_HISTORY_MESSAGES) {
     recentMessages = state.messages.slice(-MAX_HISTORY_MESSAGES);
   }
-  const response = await llm.bindTools(tools).invoke([systemMessage, ...recentMessages]);
+  const response = await llm.bindTools(agentTools).invoke([systemMessage, ...recentMessages]);
 
   return { messages: [response] };
 };
@@ -91,15 +99,15 @@ const workflow = new StateGraph(AgentState)
   .addEdge(START, "agent")
   .addConditionalEdges("agent", (state) => {
     const lastMessage = state.messages[state.messages.length - 1];
-    if (!lastMessage || !(lastMessage as AIMessage).tool_calls?.length) return END;
+    const toolCalls = (lastMessage as { tool_calls?: unknown[] } | undefined)?.tool_calls;
+    if (!toolCalls?.length) return END;
     return "tools";
   })
   .addEdge("tools", "agent");
 
 const checkpointer = new MemorySaver();
 const agentApp = workflow.compile({
-  checkpointer,
-  interruptBefore: ["tools"]
+  checkpointer
 });
 
 const sendSSE = (res: Response, data: object) => {
@@ -126,10 +134,98 @@ const getChunkText = (content: unknown): string => {
     .join("");
 };
 
+const PersistRecordSchema = z.object({
+  record_type: z.enum(["chat", "summary"]).default("chat"),
+  title: z.string().default("新對話"),
+  ai_analysis_report: z.string().default(""),
+  summary_text: z.string().optional(),
+  diet_report: z.any().optional(),
+});
+
+type PersistRecord = z.infer<typeof PersistRecordSchema>;
+
+const recordExtractor = llm.withStructuredOutput(PersistRecordSchema);
+
+const normalizeTitle = (value: string, fallbackText: string): string => {
+  const trimmed = value.trim();
+  if (trimmed.length > 0) return trimmed.slice(0, 60);
+  return fallbackText.trim().slice(0, 60) || "新對話";
+};
+
+const fallbackRecord = (userMessage: string, aiResponse: string): PersistRecord => ({
+  record_type: "chat",
+  title: normalizeTitle(userMessage, userMessage),
+  ai_analysis_report: aiResponse.trim(),
+});
+
+const extractPersistRecord = async (
+  userMessage: string,
+  aiResponse: string
+): Promise<PersistRecord> => {
+  try {
+    const structured = await recordExtractor.invoke([
+      {
+        role: "system",
+        content:
+          "請將內容轉成資料庫儲存物件。record_type 只能是 chat 或 summary。" +
+          "若是摘要，請放在 summary_text，且 ai_analysis_report 必須為空字串。" +
+          "若是一般回覆，請放在 ai_analysis_report。title 請精簡在 60 字內。"
+      },
+      {
+        role: "user",
+        content:
+          `使用者訊息：${userMessage}\n` +
+          `AI 最終回覆：${aiResponse}`
+      }
+    ]);
+
+    return {
+      ...structured,
+      record_type: structured.record_type ?? "chat",
+      title: normalizeTitle(structured.title || "", userMessage),
+      ai_analysis_report: (structured.ai_analysis_report || "").trim(),
+      summary_text: structured.summary_text?.trim(),
+    };
+  } catch (error) {
+    console.error("Record extraction failed, use fallback:", error);
+    return fallbackRecord(userMessage, aiResponse);
+  }
+};
+
+const persistRecord = async (
+  record: PersistRecord,
+  context: { thread_id: string; user_id?: string; user_message: string }
+) => {
+  if (record.record_type === "summary") {
+    const summaryPayload = {
+      room_id: context.thread_id,
+      user_id: context.user_id,
+      user_message: context.user_message,
+      title: record.title,
+      record_type: "summary" as const,
+      summary_text: record.summary_text || record.ai_analysis_report || "",
+    };
+    return logDietTool.invoke(summaryPayload);
+  }
+
+  const chatPayload = {
+    room_id: context.thread_id,
+    user_id: context.user_id,
+    user_message: context.user_message,
+    title: record.title,
+    ai_analysis_report: record.ai_analysis_report,
+    diet_report: record.diet_report ?? null,
+    record_type: "chat" as const,
+  };
+  return logDietTool.invoke(chatPayload);
+};
+
 // --- API Router ---
 app.post('/api/chat', async (req: Request, res: Response) => {
   const { message, thread_id, user_id } = req.body;
   if (!thread_id) return res.status(400).send("Missing thread_id");
+  if (!message) return res.status(400).send("Missing message");
+  const normalizedUserId = typeof user_id === "string" && user_id.trim().length > 0 ? user_id : undefined;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -140,48 +236,48 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   try {
     const runAgentStream = async (input: any) => {
       const stream = agentApp.streamEvents(input, { ...config, version: "v2" });
+      const textByMessageId = new Map<string, string>();
+      let latestMessageId: string | null = null;
+      let fallbackText = "";
+
       for await (const event of stream) {
         if (event.event === "on_chat_model_stream") {
           const content = getChunkText(event.data.chunk?.content);
-          if (content) sendSSE(res, { type: "text", content });
+          if (!content) continue;
+
+          const chunkId = event.data.chunk?.id;
+          if (typeof chunkId === "string" && chunkId.length > 0) {
+            const prev = textByMessageId.get(chunkId) || "";
+            textByMessageId.set(chunkId, `${prev}${content}`);
+            latestMessageId = chunkId;
+          } else {
+            fallbackText += content;
+          }
         } else if (event.event === "on_tool_start") {
           sendSSE(res, { type: "status", content: `AI 正在執行工具: ${event.name}...` });
         }
       }
+
+      if (latestMessageId) {
+        return textByMessageId.get(latestMessageId) || "";
+      }
+      return fallbackText;
     };
 
-    await runAgentStream({
+    const finalVisibleText = await runAgentStream({
       messages: [{ role: "user", content: message }],
-      user_id: user_id || "guest_user",
+      user_id: normalizedUserId || "guest_user",
       room_id: thread_id
     });
 
-    let state = await agentApp.getState(config);
-
-    let stepCount = 0;
-    const MAX_STEPS = 3;
-
-    while (state.next.length > 0 && stepCount < MAX_STEPS) {
-      stepCount++;
-
-      const lastMsg = state.values.messages[state.values.messages.length - 1] as AIMessage;
-      const isKnowledgeUpdate = lastMsg.tool_calls?.some(tc => tc.name === "update_knowledge_tool");
-      const isProfileUpdate = lastMsg.tool_calls?.some(tc => tc.name === "update_user_profile");
-
-      if (isKnowledgeUpdate || isProfileUpdate) {
-        const alertMessage = isKnowledgeUpdate ? '寫入系統知識庫' : '更新用戶資料';
-        sendSSE(res, {
-          type: "interrupt",
-          content: alertMessage,
-          pending_tools: state.next
-        });
-        break;
-      } else {
-        sendSSE(res, { type: "status", content: "AI 正在思考中..." });
-        await agentApp.updateState(config, null);
-        await runAgentStream(null);
-        state = await agentApp.getState(config);
-      }
+    if (finalVisibleText) {
+      sendSSE(res, { type: "text", content: finalVisibleText });
+      const record = await extractPersistRecord(message, finalVisibleText);
+      await persistRecord(record, {
+        thread_id,
+        user_id: normalizedUserId,
+        user_message: message
+      });
     }
 
     sendSSE(res, { type: "done" });
@@ -194,25 +290,16 @@ app.post('/api/chat', async (req: Request, res: Response) => {
 });
 
 app.post('/api/approve', async (req: Request, res: Response) => {
-  const { thread_id, action } = req.body;
-  const config = { configurable: { thread_id } };
-
-  if (action === "approve") {
-    await agentApp.updateState(config, null);
-    const result = await agentApp.invoke(null, config);
-
-    const finalMessage = result.messages[result.messages.length - 1];
-    const finalContent = finalMessage?.content || "任務已繼續執行";
-    res.json({ status: "approved", result: finalContent });
-  } else {
-    res.json({ status: "rejected", message: "操作已取消" });
-  }
+  res.json({
+    status: "not_required",
+    message: "目前流程已改為自動執行，不需要 approve。"
+  });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🥦 Diet Manager Agent Server 啟動`);
   console.log(`📍 Thread-based Memory: 啟用 (Supabase Ready)`);
-  console.log(`📍 Breakpoints: 啟用 (write_file)`);
+  console.log(`📍 Breakpoints: 停用 (自動工具流程)`);
   console.log(`🚀 API URL: http://localhost:${PORT}/api/chat`);
 });
 

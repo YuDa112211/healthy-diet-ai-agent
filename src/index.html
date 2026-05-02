@@ -48,7 +48,7 @@
           </h3>
           <div class="bg-slate-800 rounded-md p-3 text-sm">
             <p class="text-slate-400">Thread ID:</p>
-            <code class="text-blue-400">test_user_001</code>
+            <code id="thread-id-display" class="text-blue-400">loading...</code>
           </div>
         </div>
         <div>
@@ -144,9 +144,37 @@
     </main>
 
     <script>
-      const threadId = "test_user_001";
+      const USER_ID_KEY = "diet_user_id";
+      const THREAD_ID_KEY = "diet_thread_id";
+
+      function fallbackUuid() {
+        return `uid_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      }
+
+      function ensureUserId() {
+        let id = localStorage.getItem(USER_ID_KEY);
+        if (!id) {
+          id = (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : fallbackUuid();
+          localStorage.setItem(USER_ID_KEY, id);
+        }
+        return id;
+      }
+
+      function ensureThreadId(userId) {
+        let id = sessionStorage.getItem(THREAD_ID_KEY);
+        if (!id) {
+          id = `${userId}_${Date.now().toString(36)}`;
+          sessionStorage.setItem(THREAD_ID_KEY, id);
+        }
+        return id;
+      }
+
+      const userId = ensureUserId();
+      const threadId = ensureThreadId(userId);
       const msgDiv = document.getElementById("messages");
       const approvalPanel = document.getElementById("approval-panel");
+      const threadIdDisplay = document.getElementById("thread-id-display");
+      if (threadIdDisplay) threadIdDisplay.textContent = threadId;
 
       let currentAiMessageDiv = null;
       let thinkingBubble = null; // ⭐️ 新增：專屬思考氣泡
@@ -218,7 +246,7 @@
           const response = await fetch("http://localhost:8001/api/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message, thread_id: threadId }),
+            body: JSON.stringify({ message, thread_id: threadId, user_id: userId }),
           });
 
           const reader = response.body.getReader();
