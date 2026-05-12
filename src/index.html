@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-TW">
   <head>
     <meta charset="UTF-8" />
@@ -72,7 +72,7 @@
         class="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-8"
       >
         <div class="flex items-center gap-2">
-          <span class="font-semibold text-slate-700">AI 營養專家</span>
+          <span class="font-semibold text-slate-700">AI ??撠振</span>
           <span
             class="bg-blue-100 text-blue-700 text-xs px-2 py-0.5 rounded-full font-medium"
             >Vision Mode</span
@@ -84,7 +84,7 @@
         <div class="flex justify-center">
           <span
             class="text-xs bg-slate-200 text-slate-500 px-3 py-1 rounded-full"
-            >與 Agent 的對話已加密</span
+            >??Agent ??閰勗歇??</span
           >
         </div>
       </section>
@@ -99,8 +99,8 @@
           <div class="flex items-center gap-3 text-amber-800">
             <i class="fas fa-shield-halved text-xl"></i>
             <div>
-              <p class="font-bold text-sm">操作審核</p>
-              <p class="text-xs">Agent 請求寫入權限</p>
+              <p class="font-bold text-sm">??撖拇</p>
+              <p class="text-xs">Agent 隢?撖怠甈?</p>
             </div>
           </div>
           <div class="flex gap-2">
@@ -108,13 +108,13 @@
               onclick="sendApproval('reject')"
               class="px-3 py-1.5 bg-white border border-amber-200 text-amber-700 text-sm rounded-lg hover:bg-amber-100 transition-colors"
             >
-              拒絕
+              ??
             </button>
             <button
               onclick="sendApproval('approve')"
               class="px-3 py-1.5 bg-amber-600 text-white text-sm rounded-lg hover:bg-amber-700 shadow-md transition-colors font-semibold"
             >
-              授權執行
+              ???瑁?
             </button>
           </div>
         </div>
@@ -129,7 +129,7 @@
               type="text"
               id="userInput"
               class="bg-transparent border-none w-full p-3 text-slate-700 placeholder-slate-400 outline-none"
-              placeholder="在此輸入訊息或圖片路徑..."
+              placeholder="?冽迨頛詨閮???楝敺?.."
               onkeypress="handleEnter(event)"
             />
             <button
@@ -177,8 +177,7 @@
       if (threadIdDisplay) threadIdDisplay.textContent = threadId;
 
       let currentAiMessageDiv = null;
-      let thinkingBubble = null; // ⭐️ 新增：專屬思考氣泡
-
+      let thinkingBubble = null; // 潃? ?啣?嚗?撅祆除瘜?
       function addMessage(text, sender) {
         const wrapper = document.createElement("div");
         wrapper.className = `flex ${sender === "user" ? "justify-end" : "justify-start"} w-full animate-in fade-in duration-300 mb-4`;
@@ -196,14 +195,13 @@
         return bubble;
       }
 
-      // ⭐️ 核心優化：獨立的思考狀態 UI (像 Gemini 一樣)
+      // 潃? ?詨??芸?嚗蝡?????UI (??Gemini 銝璅?
       function showThinking(text) {
-        // 如果不要顯示後端的囉嗦文字，可以過濾
-        if (text.includes("自動放行安全工具")) return;
+        // 憒?銝?憿舐內敺垢???行?摮??臭誑?蕪
+        if (text.includes("?芸??曇?摰撌亙")) return;
 
         if (!thinkingBubble) {
-          // 如果還沒有氣泡，建一個新的
-          const wrapper = document.createElement("div");
+          // 憒????除瘜∴?撱箔????          const wrapper = document.createElement("div");
           wrapper.id = "thinking-wrapper";
           wrapper.className = "flex justify-start w-full mb-4 animate-pulse";
           wrapper.innerHTML = `
@@ -215,20 +213,64 @@
           msgDiv.appendChild(wrapper);
           thinkingBubble = wrapper;
         } else {
-          // 如果已經有了，只替換文字
+          // 憒?撌脩???嚗?踵???
           thinkingBubble.querySelector("#think-text").textContent = text;
         }
         msgDiv.scrollTop = msgDiv.scrollHeight;
       }
 
-      // ⭐️ 銷毀思考氣泡
-      function removeThinking() {
+      // 潃? ?瑟??除瘜?      function removeThinking() {
         if (thinkingBubble) {
           thinkingBubble.remove();
           thinkingBubble = null;
         }
       }
 
+      function formatVisionJsonToText(rawText) {
+        if (!rawText || typeof rawText !== "string") return null;
+        const trimmed = rawText.trim();
+        if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
+
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (!parsed || typeof parsed !== "object") return null;
+
+          if (typeof parsed.summary === "string" && parsed.summary.trim().length > 0) {
+            return 圖片摘要：;
+          }
+
+          const dishName = typeof parsed.dish_name === "string" ? parsed.dish_name.trim() : "";
+          const ingredients = Array.isArray(parsed.ingredients) ? parsed.ingredients : [];
+          if (!dishName || ingredients.length === 0) return null;
+
+          const lines = [菜色：, "食材估算："];
+          for (const item of ingredients) {
+            if (!item || typeof item !== "object") continue;
+            const name = typeof item.name === "string" ? item.name : "未知食材";
+            const weight =
+              typeof item.estimated_weight_g === "number" || typeof item.estimated_weight_g === "string"
+                ? ${item.estimated_weight_g}g
+                : "未知重量";
+            const calories =
+              typeof item.estimated_calories === "string" ? item.estimated_calories : "熱量未知";
+            const method =
+              typeof item.cooking_method === "string" ? item.cooking_method : "烹調方式未知";
+            lines.push(- （，，）);
+          }
+
+          return lines.join("\n");
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function finalizeCurrentAiMessage() {
+        if (!currentAiMessageDiv) return;
+        const formatted = formatVisionJsonToText(currentAiMessageDiv.textContent || "");
+        if (formatted) {
+          currentAiMessageDiv.textContent = formatted;
+        }
+      }
       async function sendMessage() {
         const input = document.getElementById("userInput");
         const message = input.value.trim();
@@ -238,8 +280,7 @@
         input.value = "";
         approvalPanel.style.display = "none";
 
-        // 發訊息時重置狀態
-        removeThinking();
+        // ?潸??舀??蔭???        removeThinking();
         currentAiMessageDiv = addMessage("", "ai");
 
         try {
@@ -248,6 +289,26 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message, thread_id: threadId, user_id: userId }),
           });
+
+          if (!response.ok) {
+            let errorMessage = `隡箸??券隤?(${response.status})`;
+            try {
+              const contentType = response.headers.get("content-type") || "";
+              if (contentType.includes("application/json")) {
+                const errorJson = await response.json();
+                errorMessage = errorJson?.message || errorJson?.error || errorMessage;
+              } else {
+                const errorText = await response.text();
+                if (errorText && errorText.trim().length > 0) {
+                  errorMessage = errorText.slice(0, 200);
+                }
+              }
+            } catch (_) {}
+
+            removeThinking();
+            currentAiMessageDiv.textContent = `隢?憭望?嚗?{errorMessage}`;
+            return;
+          }
 
           const reader = response.body.getReader();
           const decoder = new TextDecoder("utf-8");
@@ -267,8 +328,7 @@
                   const data = JSON.parse(line.slice(6));
 
                   if (data.type === "text") {
-                    // 當 AI 開始講話 (輸出白話文) 時，代表思考結束，銷毀旋轉氣泡！
-                    removeThinking();
+                    // ??AI ??雓店 (頛詨?質店?? ??隞?”?????瑟???瘞?部嚗?                    removeThinking();
                     currentAiMessageDiv.textContent += data.content;
                   } else if (data.type === "status") {
                     showThinking(data.content);
@@ -276,8 +336,9 @@
                     removeThinking();
                     approvalPanel.style.display = "block";
                   } else if (data.type === "done") {
-                    // 確保流程結束時氣泡一定會消失
+                    // 蝣箔?瘚?蝯??除瘜∩?摰?瘨仃
                     removeThinking();
+                    finalizeCurrentAiMessage();
                   }
                 } catch (e) {}
               }
@@ -286,13 +347,13 @@
           }
         } catch (error) {
           removeThinking();
-          addMessage("連線失敗，請檢查 Server。", "ai");
+          addMessage("???憭望?嚗?瑼Ｘ Server??, "ai");
         }
       }
 
       async function sendApproval(action) {
         approvalPanel.style.display = "none";
-        showThinking(`系統執行: ${action}`);
+        showThinking(`蝟餌絞?瑁?: ${action}`);
 
         const res = await fetch("http://localhost:8001/api/approve", {
           method: "POST",
@@ -313,3 +374,4 @@
     </script>
   </body>
 </html>
+
