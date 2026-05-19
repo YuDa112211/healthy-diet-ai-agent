@@ -406,6 +406,8 @@ const callModel = async (state: typeof AgentState.State) => {
     'Never output raw JSON directly to the user.',
     'If tool outputs JSON, convert it into concise Traditional Chinese explanation.',
     'When dish_name and ingredients exist, summarize dish and estimated calories in plain text.',
+    'If a user question is unclear, missing key context, or based on an unspecified source, ask the user to provide the source website URL in the input box before giving a definitive answer.',
+    'When asking for clarification, explicitly request: 請在輸入框貼上來源網站連結（URL）。',
     '',
     '--- Profile Update Policy ---',
     'Decide autonomously whether profile update is needed; do not force updates every turn.',
