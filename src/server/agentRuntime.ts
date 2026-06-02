@@ -1,0 +1,380 @@
+import fs from 'fs';
+import type { Response } from 'express';
+import { z } from 'zod';
+import { ChatOpenAI } from '@langchain/openai';
+import { tool } from '@langchain/core/tools';
+import { MemorySaver, StateGraph, START, END, MessagesAnnotation, Annotation } from '@langchain/langgraph';
+import { ToolNode } from '@langchain/langgraph/prebuilt';
+
+import { readKnowledgeTool, searchKnowledgeTool, updateKnowledgeTool } from '../../agent_skills/file_tools';
+import { visionAnalyzerTool } from '../../agent_skills/vision_model';
+import { calculateNutritionTool } from '../../agent_skills/calc_tools';
+import { getChatHistoryTool } from '../../agent_skills/db_tools';
+import { compressChatHistoryTool } from '../../agent_skills/summarizer_tools';
+import { checkWebPageTool, fetchWebPageTool } from '../../agent_skills/fetch_web';
+import { AGENT_FILE, INDEX_FILE, RULES_FILE } from './workspacePaths';
+import { AI_API_URL } from './supabaseRuntime';
+import { LLM_TIMEOUT_MS, toStatusText } from './httpRuntime';
+import {
+  hasAnyProfileField,
+  parseProfileUpdateProposalOutput,
+  sanitizeProfileUpdateFields,
+  type ProfileUpdateFields,
+} from './profileApproval';
+
+const sendSSE = (res: Response, data: object) => {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+};
+
+const getChunkText = (content: unknown): string => {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (
+        part &&
+        typeof part === 'object' &&
+        'text' in part &&
+        typeof (part as { text?: unknown }).text === 'string'
+      ) {
+        return (part as { text: string }).text;
+      }
+      return '';
+    })
+    .join('');
+};
+
+const getLatestAiTextFromState = (messages: unknown[] | undefined): string => {
+  if (!Array.isArray(messages)) return '';
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (!item || typeof item !== 'object') continue;
+
+    const role = (item as { role?: unknown }).role;
+    if (role !== 'assistant') continue;
+
+    const content = (item as { content?: unknown }).content;
+    const text = getChunkText(content).trim();
+    if (text.length > 0) return text;
+  }
+
+  return '';
+};
+
+const hasAnalyzeFoodToolResult = (messages: unknown[] | undefined): boolean => {
+  if (!Array.isArray(messages)) return false;
+
+  return messages.some((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const role = (item as { role?: unknown }).role;
+    const name = (item as { name?: unknown }).name;
+    if (role === 'tool' && name === 'analyze_food_image') return true;
+
+    const lcKwargsName = (item as { lc_kwargs?: { name?: unknown } }).lc_kwargs?.name;
+    if (lcKwargsName === 'analyze_food_image') return true;
+
+    return false;
+  });
+};
+
+const proposeProfileUpdateTool = tool(
+  async ({
+    nickname_to_set,
+    avatar_url_to_set,
+    height_to_set,
+    weight_to_set,
+    age_to_set,
+    gender_to_set,
+    taboo_to_add,
+    disease_to_add,
+    taboo_to_remove,
+    disease_to_remove,
+    reason,
+  }) => {
+    const fields = sanitizeProfileUpdateFields({
+      nickname_to_set,
+      avatar_url_to_set,
+      height_to_set,
+      weight_to_set,
+      age_to_set,
+      gender_to_set,
+      taboo_to_add,
+      disease_to_add,
+      taboo_to_remove,
+      disease_to_remove,
+    });
+
+    return JSON.stringify({
+      should_request_approval: hasAnyProfileField(fields),
+      reason: typeof reason === 'string' ? reason.trim() : '',
+      fields,
+    });
+  },
+  {
+    name: 'propose_profile_update',
+    description:
+      'Propose profile fields that require explicit user approval before writing to database. Only use when user clearly provided concrete new profile info.',
+    schema: z.object({
+      nickname_to_set: z.string().trim().optional(),
+      avatar_url_to_set: z.string().trim().optional(),
+      height_to_set: z.number().positive().optional(),
+      weight_to_set: z.number().positive().optional(),
+      age_to_set: z.number().positive().optional(),
+      gender_to_set: z.string().trim().optional(),
+      taboo_to_add: z.string().trim().optional(),
+      disease_to_add: z.string().trim().optional(),
+      taboo_to_remove: z.string().trim().optional(),
+      disease_to_remove: z.string().trim().optional(),
+      reason: z.string().trim().optional(),
+    }),
+  }
+);
+
+const agentTools = [
+  searchKnowledgeTool,
+  readKnowledgeTool,
+  updateKnowledgeTool,
+  visionAnalyzerTool,
+  calculateNutritionTool,
+  checkWebPageTool,
+  fetchWebPageTool,
+  getChatHistoryTool,
+  proposeProfileUpdateTool,
+  compressChatHistoryTool,
+];
+const toolNode = new ToolNode(agentTools);
+
+export const llm = new ChatOpenAI({
+  modelName: 'gemma',
+  temperature: 0,
+  timeout: LLM_TIMEOUT_MS,
+  maxRetries: 0,
+  configuration: { baseURL: AI_API_URL },
+  apiKey: 'dummy',
+});
+
+const AgentState = Annotation.Root({
+  ...MessagesAnnotation.spec,
+  user_id: Annotation<string>(),
+  room_id: Annotation<string>(),
+  user_profile_context: Annotation<string>(),
+  image_path: Annotation<string>(),
+});
+
+const callModel = async (state: typeof AgentState.State) => {
+  const agentInstructions = fs.existsSync(AGENT_FILE) ? fs.readFileSync(AGENT_FILE, 'utf-8') : '';
+  const skillsIndex = fs.existsSync(INDEX_FILE) ? fs.readFileSync(INDEX_FILE, 'utf-8') : '';
+  const nutritionRules = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf-8') : '';
+
+  const userInfo = state.user_id
+    ? `Current user id: ${state.user_id}`
+    : 'Current user id is missing.';
+  const roomInfo = state.room_id
+    ? `Current room id: ${state.room_id}`
+    : 'Current room id is missing.';
+  const userProfileContext = state.user_profile_context || 'No extra user context provided.';
+  const imagePath = state.image_path || '';
+  const needsImageToolCall = Boolean(imagePath) && !hasAnalyzeFoodToolResult(state.messages as unknown[]);
+
+  const prompt = [
+    agentInstructions,
+    '',
+    '--- Runtime Context ---',
+    userInfo,
+    roomInfo,
+    '',
+    '--- Skills Index ---',
+    skillsIndex,
+    '',
+    '--- Nutrition Rules ---',
+    nutritionRules,
+    '',
+    '--- User Profile + Conversation Summary Context ---',
+    userProfileContext,
+    '',
+    '--- Image Context ---',
+    imagePath
+      ? [
+          `Attached image path: ${imagePath}`,
+          needsImageToolCall
+            ? 'You MUST call tool analyze_food_image exactly once with this exact imagePath before your final answer.'
+            : 'Image tool result is already available in message history. Use it for your final answer.',
+        ].join('\n')
+      : 'No image attached in this request.',
+    '',
+    '--- Response Style ---',
+    'Never output raw JSON directly to the user.',
+    'If tool outputs JSON, convert it into concise Traditional Chinese explanation.',
+    'For factual health/nutrition/food-safety claims, call search_knowledge_tool first, then answer with cited source_path values.',
+    'When search_knowledge_tool returns relevant hits, prioritize those sources and mention uncertainty if evidence is weak.',
+    'When dish_name and ingredients exist, summarize dish and estimated calories in plain text.',
+    'If user asks whether a URL/page is valid/correct/reachable (e.g., 這個網頁是對的嗎), call check_web_page first, then answer based on status/final_url/title.',
+    'If user message contains multiple URLs, verify only the first URL and clearly state that other URLs were ignored in this turn.',
+    'If user message contains one or more URLs and asks whether claims are reasonable/correct/trustworthy, call fetch_web_page for the most relevant URL before giving a conclusion.',
+    'When URL content cannot be fetched, clearly say verification is limited and ask the user for a clearer source page.',
+    'If a user question is unclear, missing key context, or based on an unspecified source, ask the user to provide the source website URL in the input box before giving a definitive answer.',
+    'When asking for clarification, explicitly request: 請在輸入框貼上來源網站連結（URL）。',
+    '',
+    '--- Profile Update Policy ---',
+    'Decide autonomously whether profile update is needed; do not force updates every turn.',
+    'If user clearly provides NEW self-profile information, state the suggested changes briefly.',
+    'When you detect concrete new profile fields, call tool propose_profile_update exactly once before final answer.',
+    'Food dislikes / cannot eat / religion restrictions / wants to reduce specific foods should be treated as taboo_to_add when concrete items are provided.',
+    'If user clearly says a previous taboo/disease should be removed, use taboo_to_remove or disease_to_remove with a concrete item.',
+    'Do NOT call propose_profile_update for ambiguous questions without concrete values (e.g., 我不喜歡吃什麼？, 我要少吃什麼？).',
+    'Actual database update requires user approval and is handled by backend approval flow.',
+    'Supported profile fields: nickname, avatar_url, height, weight, age, gender, taboo, disease.',
+    'Do not update profile for guesses, hypotheticals, or unclear statements.',
+    'If information is ambiguous, ask a short confirmation question.',
+    'When no new profile info is provided, continue normal conversation.',
+  ].join('\n');
+
+  const systemMessage = { role: 'system', content: prompt };
+
+  const MAX_HISTORY_MESSAGES = 10;
+  let recentMessages = state.messages;
+  if (state.messages.length > MAX_HISTORY_MESSAGES) {
+    recentMessages = state.messages.slice(-MAX_HISTORY_MESSAGES);
+  }
+
+  const modelWithTools = needsImageToolCall
+    ? llm.bindTools(agentTools, { tool_choice: 'analyze_food_image' })
+    : llm.bindTools(agentTools);
+
+  const response = await modelWithTools.invoke([systemMessage, ...recentMessages]);
+  return { messages: [response] };
+};
+
+const workflow = new StateGraph(AgentState)
+  .addNode('agent', callModel)
+  .addNode('tools', toolNode)
+  .addEdge(START, 'agent')
+  .addConditionalEdges('agent', (state) => {
+    const lastMessage = state.messages[state.messages.length - 1];
+    const toolCalls = (lastMessage as { tool_calls?: unknown[] } | undefined)?.tool_calls;
+    if (!toolCalls?.length) return END;
+    return 'tools';
+  })
+  .addEdge('tools', 'agent');
+
+const checkpointer = new MemorySaver();
+const agentApp = workflow.compile({
+  checkpointer,
+});
+
+export const runAgentStream = async (
+  res: Response,
+  config: { configurable: { thread_id: string } },
+  input: {
+    messages: Array<{ role: 'user'; content: string }>;
+    user_id: string;
+    room_id: string;
+    user_profile_context: string;
+    image_path: string;
+  }
+): Promise<{
+  finalText: string;
+  toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }>;
+  approvalProposals: ProfileUpdateFields[];
+}> => {
+  const stream = agentApp.streamEvents(input, { ...config, version: 'v2' });
+  const textByMessageId = new Map<string, string>();
+  const toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }> = [];
+  const approvalProposals: ProfileUpdateFields[] = [];
+  let latestMessageId: string | null = null;
+  let fallbackText = '';
+
+  for await (const event of stream) {
+    if (event.event === 'on_chat_model_stream') {
+      const content = getChunkText(event.data.chunk?.content);
+      if (!content) continue;
+
+      const chunkId = event.data.chunk?.id;
+      if (typeof chunkId === 'string' && chunkId.length > 0) {
+        const prev = textByMessageId.get(chunkId) || '';
+        const next = content.startsWith(prev) ? content : `${prev}${content}`;
+        textByMessageId.set(chunkId, next);
+        latestMessageId = chunkId;
+      } else {
+        const next = content.startsWith(fallbackText) ? content : `${fallbackText}${content}`;
+        fallbackText = next;
+      }
+    } else if (event.event === 'on_tool_start') {
+      const toolName = event.name || 'unknown_tool';
+      toolTraces.push({ name: toolName, status: 'running' });
+      sendSSE(res, { type: 'status', content: `Tool ${toolName}: running` });
+    } else if (event.event === 'on_tool_end') {
+      const toolName = event.name || 'unknown_tool';
+      const toolOutput = (event.data as { output?: unknown } | undefined)?.output;
+      const resultPreview = toStatusText(toolOutput);
+      const traceIndex = [...toolTraces]
+        .reverse()
+        .findIndex((trace) => trace.name === toolName && trace.status === 'running');
+
+      if (traceIndex >= 0) {
+        const actualIndex = toolTraces.length - 1 - traceIndex;
+        toolTraces[actualIndex] = { name: toolName, status: 'success', result: resultPreview };
+      } else {
+        toolTraces.push({ name: toolName, status: 'success', result: resultPreview });
+      }
+
+      sendSSE(res, { type: 'status', content: `Tool ${toolName}: success` });
+      if (resultPreview) {
+        sendSSE(res, { type: 'status', content: `Tool ${toolName} result: ${resultPreview}` });
+      }
+      if (toolName === 'propose_profile_update') {
+        const proposal = parseProfileUpdateProposalOutput(toolOutput);
+        if (proposal) {
+          approvalProposals.push(proposal);
+          sendSSE(res, { type: 'status', content: 'Profile update proposal detected.' });
+        } else {
+          console.warn(
+            `Failed to parse propose_profile_update output: ${toStatusText(toolOutput, 600)}`
+          );
+        }
+      }
+    } else if (event.event === 'on_tool_error') {
+      const toolName = event.name || 'unknown_tool';
+      const errorPreview = toStatusText((event.data as { error?: unknown } | undefined)?.error);
+      const traceIndex = [...toolTraces]
+        .reverse()
+        .findIndex((trace) => trace.name === toolName && trace.status === 'running');
+
+      if (traceIndex >= 0) {
+        const actualIndex = toolTraces.length - 1 - traceIndex;
+        toolTraces[actualIndex] = { name: toolName, status: 'error', result: errorPreview };
+      } else {
+        toolTraces.push({ name: toolName, status: 'error', result: errorPreview });
+      }
+
+      sendSSE(res, { type: 'status', content: `Tool ${toolName}: error` });
+      if (errorPreview) {
+        sendSSE(res, { type: 'status', content: `Tool ${toolName} error: ${errorPreview}` });
+      }
+    }
+  }
+
+  const streamedText = latestMessageId
+    ? textByMessageId.get(latestMessageId) || ''
+    : fallbackText;
+
+  if (streamedText.trim().length > 0) {
+    return { finalText: streamedText, toolTraces, approvalProposals };
+  }
+
+  try {
+    const snapshot = await agentApp.getState(config);
+    const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
+    const recoveredText = getLatestAiTextFromState(stateMessages);
+    if (recoveredText.length > 0) {
+      return { finalText: recoveredText, toolTraces, approvalProposals };
+    }
+  } catch (stateError) {
+    console.error('Failed to recover final assistant text from state:', stateError);
+  }
+
+  return { finalText: '', toolTraces, approvalProposals };
+};

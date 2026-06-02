@@ -32,7 +32,7 @@ export const readCodeTool = tool(
     name: "read_workspace_code",
     description: "讀取專案內的程式碼或 Markdown 檔案，幫助你理解系統現有架構與邏輯。傳入相對路徑即可。",
     schema: z.object({
-      filePath: z.string().describe("相對於專案根目錄的檔案路徑，例如: src/agent_skills/vision_analyzer/draw_bbox.ts"),
+      filePath: z.string().describe("相對於專案根目錄的檔案路徑，例如: src/serverHandlers.ts"),
     }),
   }
 );

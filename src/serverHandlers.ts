@@ -1,516 +1,48 @@
-﻿import 'dotenv/config';
-import express from 'express';
 import type { Request, Response } from 'express';
-import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
 import { z } from 'zod';
-import { createClient } from '@supabase/supabase-js';
-import { ChatOpenAI } from '@langchain/openai';
-import { tool } from '@langchain/core/tools';
-import { MemorySaver, StateGraph, START, END, MessagesAnnotation, Annotation } from '@langchain/langgraph';
-import { ToolNode } from '@langchain/langgraph/prebuilt';
-
-import { readKnowledgeTool, updateKnowledgeTool } from '../agent_skills/admin_knowledge/file_tools';
-import { visionAnalyzerTool } from '../agent_skills/vision_analyzer/vision_model';
-import { calculateNutritionTool } from '../agent_skills/calorie_calculator/calc_tools';
-import { getChatHistoryTool, getUserProfileTool, updateUserProfileTool } from '../agent_skills/supabase_logger/db_tools';
-import { compressChatHistoryTool } from '../agent_skills/memory_summarizer/summarizer_tools';
-
-export const corsMiddleware = cors();
-export const MAX_REQUEST_BODY_MB = Number(process.env.MAX_REQUEST_BODY_MB || 15);
-export const REQUEST_BODY_LIMIT = `${MAX_REQUEST_BODY_MB}mb`;
-export const jsonBodyParser = express.json({ limit: REQUEST_BODY_LIMIT });
-export const urlencodedBodyParser = express.urlencoded({ extended: true, limit: REQUEST_BODY_LIMIT });
-
-const createRequestId = (): string =>
-  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-
-const formatDurationMs = (startAt: number): string => `${Date.now() - startAt}ms`;
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 45000);
-const PROFILE_LOOKUP_TIMEOUT_MS = Number(process.env.PROFILE_LOOKUP_TIMEOUT_MS || 4000);
-const AGENT_STREAM_TIMEOUT_MS = Number(process.env.AGENT_STREAM_TIMEOUT_MS || 60000);
-const USER_PROFILE_CACHE_TTL_MS = Number(process.env.USER_PROFILE_CACHE_TTL_MS || 120000);
-
-const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
-  let timeoutHandle: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          reject(new Error(`${label} timeout after ${timeoutMs}ms`));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-  }
-};
-
-const isTimeoutError = (error: unknown): boolean => {
-  return error instanceof Error && /timeout/i.test(error.message);
-};
-
-const isUpstreamConnectionError = (error: unknown): boolean => {
-  const text = toStatusText(error, 2000).toLowerCase();
-  return (
-    text.includes('connectionrefused') ||
-    text.includes('unable to connect') ||
-    text.includes('api connection error') ||
-    text.includes('connection error')
-  );
-};
-
-const ANSI = {
-  reset: '\x1b[0m',
-  blue: '\x1b[34m',
-  red: '\x1b[31m',
-  yellow: '\x1b[33m',
-};
-
-const rawConsoleLog = console.log.bind(console);
-const rawConsoleError = console.error.bind(console);
-const rawConsoleWarn = console.warn.bind(console);
-
-console.log = (...args: unknown[]) => {
-  rawConsoleLog(`${ANSI.blue}[INFO]${ANSI.reset}`, ...args);
-};
-
-console.error = (...args: unknown[]) => {
-  rawConsoleError(`${ANSI.red}[ERROR]${ANSI.reset}`, ...args);
-};
-
-console.warn = (...args: unknown[]) => {
-  rawConsoleWarn(`${ANSI.yellow}[WARN]${ANSI.reset}`, ...args);
-};
-
-const toStatusText = (value: unknown, maxLength = 220): string => {
-  let raw = '';
-  if (typeof value === 'string') {
-    raw = value;
-  } else {
-    try {
-      raw = JSON.stringify(value);
-    } catch {
-      raw = String(value);
-    }
-  }
-
-  const oneLine = raw.replace(/\s+/g, ' ').trim();
-  if (oneLine.length <= maxLength) return oneLine;
-  return `${oneLine.slice(0, maxLength)}...`;
-};
-
-const sanitizeForLog = (body: unknown): Record<string, unknown> => {
-  if (!body || typeof body !== 'object') return {};
-  const raw = body as Record<string, unknown>;
-  return {
-    thread_id: typeof raw.thread_id === 'string' ? raw.thread_id : undefined,
-    chat_history_id: typeof raw.chat_history_id === 'string' ? raw.chat_history_id : undefined,
-    user_id: typeof raw.user_id === 'string' ? raw.user_id : undefined,
-    is_new_conversation:
-      typeof raw.is_new_conversation === 'boolean' ? raw.is_new_conversation : undefined,
-    message_length: typeof raw.message === 'string' ? raw.message.length : undefined,
-    user_context_count: Array.isArray(raw.user_context) ? raw.user_context.length : undefined,
-    has_image: raw.image != null,
-    image_mime_type:
-      typeof raw.image_mime_type === 'string'
-        ? raw.image_mime_type
-        : typeof raw.imageMimeType === 'string'
-          ? raw.imageMimeType
-          : undefined,
-  };
-};
-
-export const requestLoggerMiddleware = (req: Request, res: Response, next: (err?: unknown) => void) => {
-  const requestId = req.header('x-request-id')?.trim() || createRequestId();
-  const startAt = Date.now();
-  res.locals.requestId = requestId;
-
-  console.log(
-    `[REQ ${requestId}] -> ${req.method} ${req.originalUrl} ip=${req.ip || 'unknown'} body=${JSON.stringify(
-      sanitizeForLog(req.body)
-    )}`
-  );
-
-  res.on('finish', () => {
-    console.log(
-      `[REQ ${requestId}] <- ${req.method} ${req.originalUrl} status=${res.statusCode} duration=${formatDurationMs(
-        startAt
-      )}`
-    );
-  });
-
-  next();
-};
-
-const ROOT_DIR = path.resolve(__dirname, '..');
-const USERS_IMAGES_DIR = path.join(ROOT_DIR, 'users_images');
-const KNOWLEDGE_BASE_DIR = path.join(ROOT_DIR, 'knowledge_base');
-const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 10 * 1024 * 1024);
-
-const AGENT_FILE = path.join(KNOWLEDGE_BASE_DIR, 'AGENT.md');
-const INDEX_FILE = path.join(KNOWLEDGE_BASE_DIR, 'SKILLS_INDEX.md');
-const RULES_FILE = path.join(KNOWLEDGE_BASE_DIR, 'NUTRITION_RULES.md');
-
-export const imagesStaticMiddleware = express.static(USERS_IMAGES_DIR);
-
-const IMAGE_MIME_TO_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/jpg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-};
-
-const sanitizePathToken = (value: string): string =>
-  value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
-
-const parseDataUrlImage = (
-  raw: string
-): { mimeType: string; buffer: Buffer } | null => {
-  const match = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-  if (!match) return null;
-  const mimeTypeRaw = match[1];
-  const base64 = match[2];
-  if (!mimeTypeRaw || !base64) return null;
-  const mimeType = mimeTypeRaw.toLowerCase();
-  const buffer = Buffer.from(base64, 'base64');
-  return { mimeType, buffer };
-};
-
-const parsePlainBase64Image = (
-  raw: string,
-  mimeTypeHint?: string
-): { mimeType: string; buffer: Buffer } | null => {
-  const normalized = raw.trim().replace(/\s+/g, '');
-  if (!normalized) return null;
-  if (normalized.startsWith('data:image/')) return null;
-  if (!/^[A-Za-z0-9+/=]+$/.test(normalized)) return null;
-
-  const buffer = Buffer.from(normalized, 'base64');
-  if (!buffer || buffer.length === 0) return null;
-
-  const hinted = (mimeTypeHint || '').toLowerCase();
-  const mimeType = IMAGE_MIME_TO_EXT[hinted] ? hinted : 'image/jpeg';
-  return { mimeType, buffer };
-};
-
-const saveIncomingImageToWorkspace = (input: {
-  rawImage: unknown;
-  userId?: string;
-  threadId: string;
-  mimeTypeHint?: string;
-}): string | undefined => {
-  const { rawImage, userId, threadId, mimeTypeHint: topLevelMimeHint } = input;
-  if (!rawImage) return undefined;
-
-  if (typeof rawImage === 'object') {
-    const objectImage = rawImage as Record<string, unknown>;
-    const directPath = objectImage.imagePath ?? objectImage.image_path ?? objectImage.path;
-    if (typeof directPath === 'string' && directPath.trim().length > 0) {
-      return directPath.trim();
-    }
-  }
-
-  let dataUrl: string | undefined;
-  let mimeTypeHint: string | undefined;
-  if (typeof rawImage === 'string') {
-    dataUrl = rawImage;
-  } else if (rawImage && typeof rawImage === 'object') {
-    const objectImage = rawImage as Record<string, unknown>;
-    const maybeDataUrl = objectImage.dataUrl ?? objectImage.data_url ?? objectImage.url ?? objectImage.src;
-    const maybeBase64 = objectImage.base64 ?? objectImage.image_base64;
-    const maybeMime = objectImage.mimeType ?? objectImage.mime_type ?? objectImage.type;
-    if (typeof maybeMime === 'string') mimeTypeHint = maybeMime.toLowerCase();
-
-    if (typeof maybeDataUrl === 'string' && maybeDataUrl.startsWith('data:image/')) {
-      dataUrl = maybeDataUrl;
-    } else if (typeof maybeBase64 === 'string' && maybeBase64.trim().length > 0) {
-      const normalizedMime = mimeTypeHint && IMAGE_MIME_TO_EXT[mimeTypeHint] ? mimeTypeHint : 'image/jpeg';
-      dataUrl = `data:${normalizedMime};base64,${maybeBase64.trim()}`;
-    }
-  }
-
-  let parsed = dataUrl ? parseDataUrlImage(dataUrl) : null;
-  if (!parsed && typeof rawImage === 'string') {
-    parsed = parsePlainBase64Image(rawImage, topLevelMimeHint);
-  }
-
-  if (!parsed && rawImage && typeof rawImage === 'object') {
-    const objectImage = rawImage as Record<string, unknown>;
-    const maybeBase64 = objectImage.base64 ?? objectImage.image_base64;
-    const nestedMimeHint =
-      typeof objectImage.mimeType === 'string'
-        ? objectImage.mimeType
-        : typeof objectImage.mime_type === 'string'
-          ? objectImage.mime_type
-          : topLevelMimeHint;
-    if (typeof maybeBase64 === 'string') {
-      parsed = parsePlainBase64Image(maybeBase64, nestedMimeHint);
-    }
-  }
-
-  if (!parsed) {
-    throw new Error('Invalid image payload format. Expected data URL or base64 string.');
-  }
-
-  const normalizedMime = IMAGE_MIME_TO_EXT[parsed.mimeType] ? parsed.mimeType : 'image/jpeg';
-  const ext = IMAGE_MIME_TO_EXT[normalizedMime];
-
-  if (parsed.buffer.length === 0) {
-    throw new Error('Empty image buffer.');
-  }
-  if (parsed.buffer.length > MAX_IMAGE_BYTES) {
-    throw new Error(
-      `Image payload is too large (${parsed.buffer.length} bytes). Max allowed is ${MAX_IMAGE_BYTES} bytes.`
-    );
-  }
-
-  const safeUserSegment = sanitizePathToken(userId || 'guest_user');
-  const safeThreadSegment = sanitizePathToken(threadId || 'thread');
-  const userDir = path.join(USERS_IMAGES_DIR, safeUserSegment);
-  fs.mkdirSync(userDir, { recursive: true });
-
-  const filename = `${safeThreadSegment}_${Date.now()}.${ext}`;
-  const absolutePath = path.join(userDir, filename);
-  fs.writeFileSync(absolutePath, parsed.buffer);
-
-  return path.join('users_images', safeUserSegment, filename);
-};
-
-export const AI_API_URL = process.env.AI_API_URL || 'http://100.113.105.18:8080/v1';
-
-const supabaseUrl = process.env.SUPABASE_URL || '';
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY || '';
-const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
-export const isSupabaseReady = Boolean(supabase);
-
-const proposeProfileUpdateTool = tool(
-  async ({
-    nickname_to_set,
-    avatar_url_to_set,
-    height_to_set,
-    weight_to_set,
-    age_to_set,
-    gender_to_set,
-    taboo_to_add,
-    disease_to_add,
-    reason,
-  }) => {
-    const fields = sanitizeProfileUpdateFields({
-      nickname_to_set,
-      avatar_url_to_set,
-      height_to_set,
-      weight_to_set,
-      age_to_set,
-      gender_to_set,
-      taboo_to_add,
-      disease_to_add,
-    });
-
-    return JSON.stringify({
-      should_request_approval: hasAnyProfileField(fields),
-      reason: typeof reason === 'string' ? reason.trim() : '',
-      fields,
-    });
-  },
-  {
-    name: 'propose_profile_update',
-    description:
-      'Propose profile fields that require explicit user approval before writing to database. Only use when user clearly provided concrete new profile info.',
-    schema: z.object({
-      nickname_to_set: z.string().trim().optional(),
-      avatar_url_to_set: z.string().trim().optional(),
-      height_to_set: z.number().positive().optional(),
-      weight_to_set: z.number().positive().optional(),
-      age_to_set: z.number().positive().optional(),
-      gender_to_set: z.string().trim().optional(),
-      taboo_to_add: z.string().trim().optional(),
-      disease_to_add: z.string().trim().optional(),
-      reason: z.string().trim().optional(),
-    }),
-  }
-);
-
-const agentTools = [
-  readKnowledgeTool,
-  updateKnowledgeTool,
-  visionAnalyzerTool,
-  calculateNutritionTool,
-  getChatHistoryTool,
-  proposeProfileUpdateTool,
-  compressChatHistoryTool,
-];
-const toolNode = new ToolNode(agentTools);
-
-const llm = new ChatOpenAI({
-  modelName: 'gemma',
-  temperature: 0,
-  timeout: LLM_TIMEOUT_MS,
-  maxRetries: 0,
-  configuration: { baseURL: AI_API_URL },
-  apiKey: 'dummy',
-});
-
-const AgentState = Annotation.Root({
-  ...MessagesAnnotation.spec,
-  user_id: Annotation<string>(),
-  room_id: Annotation<string>(),
-  user_profile_context: Annotation<string>(),
-  image_path: Annotation<string>(),
-});
-
-const callModel = async (state: typeof AgentState.State) => {
-  const agentInstructions = fs.existsSync(AGENT_FILE) ? fs.readFileSync(AGENT_FILE, 'utf-8') : '';
-  const skillsIndex = fs.existsSync(INDEX_FILE) ? fs.readFileSync(INDEX_FILE, 'utf-8') : '';
-  const nutritionRules = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf-8') : '';
-
-  const userInfo = state.user_id
-    ? `Current user id: ${state.user_id}`
-    : 'Current user id is missing.';
-  const roomInfo = state.room_id
-    ? `Current room id: ${state.room_id}`
-    : 'Current room id is missing.';
-  const userProfileContext = state.user_profile_context || 'No extra user context provided.';
-  const imagePath = state.image_path || '';
-  const needsImageToolCall = Boolean(imagePath) && !hasAnalyzeFoodToolResult(state.messages as unknown[]);
-
-  const prompt = [
-    agentInstructions,
-    '',
-    '--- Runtime Context ---',
-    userInfo,
-    roomInfo,
-    '',
-    '--- Skills Index ---',
-    skillsIndex,
-    '',
-    '--- Nutrition Rules ---',
-    nutritionRules,
-    '',
-    '--- User Profile + Conversation Summary Context ---',
-    userProfileContext,
-    '',
-    '--- Image Context ---',
-    imagePath
-      ? [
-          `Attached image path: ${imagePath}`,
-          needsImageToolCall
-            ? 'You MUST call tool analyze_food_image exactly once with this exact imagePath before your final answer.'
-            : 'Image tool result is already available in message history. Use it for your final answer.',
-        ].join('\n')
-      : 'No image attached in this request.',
-    '',
-    '--- Response Style ---',
-    'Never output raw JSON directly to the user.',
-    'If tool outputs JSON, convert it into concise Traditional Chinese explanation.',
-    'When dish_name and ingredients exist, summarize dish and estimated calories in plain text.',
-    'If a user question is unclear, missing key context, or based on an unspecified source, ask the user to provide the source website URL in the input box before giving a definitive answer.',
-    'When asking for clarification, explicitly request: 請在輸入框貼上來源網站連結（URL）。',
-    '',
-    '--- Profile Update Policy ---',
-    'Decide autonomously whether profile update is needed; do not force updates every turn.',
-    'If user clearly provides NEW self-profile information, state the suggested changes briefly.',
-    'When you detect concrete new profile fields, call tool propose_profile_update exactly once before final answer.',
-    'Food dislikes / cannot eat / religion restrictions / wants to reduce specific foods should be treated as taboo_to_add when concrete items are provided.',
-    'Do NOT call propose_profile_update for ambiguous questions without concrete values (e.g., 我不喜歡吃什麼？, 我要少吃什麼？).',
-    'Actual database update requires user approval and is handled by backend approval flow.',
-    'Supported profile fields: nickname, avatar_url, height, weight, age, gender, taboo, disease.',
-    'Do not update profile for guesses, hypotheticals, or unclear statements.',
-    'If information is ambiguous, ask a short confirmation question.',
-    'When no new profile info is provided, continue normal conversation.',
-  ].join('\n');
-
-  const systemMessage = { role: 'system', content: prompt };
-
-  const MAX_HISTORY_MESSAGES = 10;
-  let recentMessages = state.messages;
-  if (state.messages.length > MAX_HISTORY_MESSAGES) {
-    recentMessages = state.messages.slice(-MAX_HISTORY_MESSAGES);
-  }
-
-  const modelWithTools = needsImageToolCall
-    ? llm.bindTools(agentTools, { tool_choice: 'analyze_food_image' })
-    : llm.bindTools(agentTools);
-
-  const response = await modelWithTools.invoke([systemMessage, ...recentMessages]);
-  return { messages: [response] };
-};
-
-const workflow = new StateGraph(AgentState)
-  .addNode('agent', callModel)
-  .addNode('tools', toolNode)
-  .addEdge(START, 'agent')
-  .addConditionalEdges('agent', (state) => {
-    const lastMessage = state.messages[state.messages.length - 1];
-    const toolCalls = (lastMessage as { tool_calls?: unknown[] } | undefined)?.tool_calls;
-    if (!toolCalls?.length) return END;
-    return 'tools';
-  })
-  .addEdge('tools', 'agent');
-
-const checkpointer = new MemorySaver();
-const agentApp = workflow.compile({
-  checkpointer,
-});
-
-const sendSSE = (res: Response, data: object) => {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
-};
-
-const getChunkText = (content: unknown): string => {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-
-  return content
-    .map((part) => {
-      if (typeof part === 'string') return part;
-      if (
-        part &&
-        typeof part === 'object' &&
-        'text' in part &&
-        typeof (part as { text?: unknown }).text === 'string'
-      ) {
-        return (part as { text: string }).text;
-      }
-      return '';
-    })
-    .join('');
-};
-
-const getLatestAiTextFromState = (messages: unknown[] | undefined): string => {
-  if (!Array.isArray(messages)) return '';
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const item = messages[index];
-    if (!item || typeof item !== 'object') continue;
-
-    const role = (item as { role?: unknown }).role;
-    if (role !== 'assistant') continue;
-
-    const content = (item as { content?: unknown }).content;
-    const text = getChunkText(content).trim();
-    if (text.length > 0) return text;
-  }
-
-  return '';
-};
-
-const hasAnalyzeFoodToolResult = (messages: unknown[] | undefined): boolean => {
-  if (!Array.isArray(messages)) return false;
-
-  return messages.some((item) => {
-    if (!item || typeof item !== 'object') return false;
-    const role = (item as { role?: unknown }).role;
-    const name = (item as { name?: unknown }).name;
-    if (role === 'tool' && name === 'analyze_food_image') return true;
-
-    const lcKwargsName = (item as { lc_kwargs?: { name?: unknown } }).lc_kwargs?.name;
-    if (lcKwargsName === 'analyze_food_image') return true;
-
-    return false;
-  });
+import { getUserProfileTool, updateUserProfileTool } from '../agent_skills/db_tools';
+import { llm, runAgentStream } from './server/agentRuntime';
+import {
+  AGENT_STREAM_TIMEOUT_MS,
+  PROFILE_LOOKUP_TIMEOUT_MS,
+  REQUEST_BODY_LIMIT,
+  USER_PROFILE_CACHE_TTL_MS,
+  corsMiddleware,
+  createRequestId,
+  formatDurationMs,
+  isTimeoutError,
+  isUpstreamConnectionError,
+  jsonBodyParser,
+  requestLoggerMiddleware,
+  toStatusText,
+  urlencodedBodyParser,
+  withTimeout,
+} from './server/httpRuntime';
+import { saveIncomingImageToWorkspace } from './server/imageStorage';
+import {
+  PENDING_APPROVAL_TTL_MS,
+  buildApprovalProposalItems,
+  cleanupExpiredApprovals,
+  clearPendingApprovalById,
+  clearPendingApprovalByThread,
+  formatProfileUpdateSummary,
+  hasAnyProfileField,
+  pendingProfileUpdates,
+  type ApprovalProposalItem,
+  type ProfileUpdateFields,
+} from './server/profileApproval';
+import { AI_API_URL, isSupabaseReady, supabase } from './server/supabaseRuntime';
+import { imagesStaticMiddleware } from './server/workspacePaths';
+
+export {
+  AI_API_URL,
+  corsMiddleware,
+  imagesStaticMiddleware,
+  isSupabaseReady,
+  jsonBodyParser,
+  requestLoggerMiddleware,
+  REQUEST_BODY_LIMIT,
+  urlencodedBodyParser,
 };
 
 const ChatRequestSchema = z
@@ -559,258 +91,12 @@ const ConversationTitleSchema = z.object({
 const summaryExtractor = llm.withStructuredOutput(ConversationSummarySchema);
 const titleExtractor = llm.withStructuredOutput(ConversationTitleSchema);
 
-const ProfileUpdateFieldsSchema = z.object({
-  nickname_to_set: z.string().trim().optional(),
-  avatar_url_to_set: z.string().trim().optional(),
-  height_to_set: z.number().positive().optional(),
-  weight_to_set: z.number().positive().optional(),
-  age_to_set: z.number().positive().optional(),
-  gender_to_set: z.string().trim().optional(),
-  taboo_to_add: z.string().trim().optional(),
-  disease_to_add: z.string().trim().optional(),
-});
-
-type ProfileUpdateFields = z.infer<typeof ProfileUpdateFieldsSchema>;
-type ProfileUpdateFieldKey = keyof ProfileUpdateFields;
-
-type ApprovalProposalItem = {
-  field: ProfileUpdateFieldKey;
-  label: string;
-  action: 'set' | 'add';
-  value: string | number;
-};
-
-const PROFILE_UPDATE_META: Record<ProfileUpdateFieldKey, { label: string; action: 'set' | 'add' }> = {
-  nickname_to_set: { label: '暱稱', action: 'set' },
-  avatar_url_to_set: { label: '頭像 URL', action: 'set' },
-  height_to_set: { label: '身高', action: 'set' },
-  weight_to_set: { label: '體重', action: 'set' },
-  age_to_set: { label: '年齡', action: 'set' },
-  gender_to_set: { label: '性別', action: 'set' },
-  taboo_to_add: { label: '忌口', action: 'add' },
-  disease_to_add: { label: '疾病', action: 'add' },
-};
-
-type PendingProfileUpdate = {
-  approvalId: string;
-  requestId: string;
-  threadId: string;
-  userId: string;
-  deferredAiReply: string;
-  fields: ProfileUpdateFields;
-  items: ApprovalProposalItem[];
-  summary: string;
-  createdAt: number;
-  expiresAt: number;
-};
-
 type UserProfileCacheEntry = {
   context: string;
   expiresAt: number;
 };
 
-const PENDING_APPROVAL_TTL_MS = 10 * 60 * 1000;
-const pendingProfileUpdates = new Map<string, PendingProfileUpdate>();
-const pendingApprovalByThread = new Map<string, string>();
 const userProfileCache = new Map<string, UserProfileCacheEntry>();
-
-const hasAnyProfileField = (fields: ProfileUpdateFields): boolean => {
-  return Object.entries(fields).some(([, value]) => {
-    if (value == null) return false;
-    if (typeof value === 'string') return value.trim().length > 0;
-    return true;
-  });
-};
-
-const parseJsonSafe = (value: string): unknown => {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-};
-
-const normalizeProposalCandidate = (rawOutput: unknown): unknown => {
-  let candidate: unknown = rawOutput;
-  if (typeof candidate === 'string') {
-    candidate = parseJsonSafe(candidate);
-  }
-
-  if (!candidate || typeof candidate !== 'object') return candidate;
-  const objectCandidate = candidate as Record<string, unknown>;
-
-  const toolMessageContent =
-    objectCandidate.kwargs &&
-    typeof objectCandidate.kwargs === 'object' &&
-    'content' in (objectCandidate.kwargs as Record<string, unknown>)
-      ? (objectCandidate.kwargs as Record<string, unknown>).content
-      : undefined;
-
-  if (typeof toolMessageContent === 'string') {
-    return parseJsonSafe(toolMessageContent);
-  }
-
-  if (typeof objectCandidate.content === 'string') {
-    return parseJsonSafe(objectCandidate.content);
-  }
-
-  return candidate;
-};
-
-const parseProfileUpdateProposalOutput = (rawOutput: unknown): ProfileUpdateFields | null => {
-  const candidate = normalizeProposalCandidate(rawOutput);
-  if (!candidate || typeof candidate !== 'object') return null;
-
-  const value = candidate as Record<string, unknown>;
-  const shouldRequestApproval =
-    value.should_request_approval == null ? true : Boolean(value.should_request_approval);
-
-  const maybeFields = value.fields && typeof value.fields === 'object' ? value.fields : value;
-  const parsed = ProfileUpdateFieldsSchema.safeParse(maybeFields);
-  if (!parsed.success) return null;
-
-  const sanitized = sanitizeProfileUpdateFields(parsed.data);
-  if (!hasAnyProfileField(sanitized)) return null;
-  if (!shouldRequestApproval) return null;
-  return sanitized;
-};
-
-const cleanupExpiredApprovals = () => {
-  const now = Date.now();
-  for (const [approvalId, pending] of pendingProfileUpdates.entries()) {
-    if (pending.expiresAt <= now) {
-      pendingProfileUpdates.delete(approvalId);
-      if (pendingApprovalByThread.get(pending.threadId) === approvalId) {
-        pendingApprovalByThread.delete(pending.threadId);
-      }
-    }
-  }
-};
-
-const clearPendingApprovalById = (approvalId: string) => {
-  const pending = pendingProfileUpdates.get(approvalId);
-  if (!pending) return;
-  pendingProfileUpdates.delete(approvalId);
-  if (pendingApprovalByThread.get(pending.threadId) === approvalId) {
-    pendingApprovalByThread.delete(pending.threadId);
-  }
-};
-
-const clearPendingApprovalByThread = (threadId: string) => {
-  const existingApprovalId = pendingApprovalByThread.get(threadId);
-  if (!existingApprovalId) return;
-  pendingApprovalByThread.delete(threadId);
-  pendingProfileUpdates.delete(existingApprovalId);
-};
-
-const cleanupExpiredUserProfileCache = () => {
-  const now = Date.now();
-  for (const [userId, item] of userProfileCache.entries()) {
-    if (item.expiresAt <= now) {
-      userProfileCache.delete(userId);
-    }
-  }
-};
-
-const PROFILE_AMBIGUOUS_VALUE_TOKENS = new Set([
-  '什麼',
-  '甚麼',
-  '什麽',
-  '哪些',
-  '哪個',
-  '不知道',
-  '不確定',
-  '隨便',
-  '都可以',
-  'any',
-  'anything',
-  'something',
-  'whatever',
-]);
-
-const normalizeProfileListValue = (rawValue: string): string | undefined => {
-  const trimmed = rawValue
-    .trim()
-    .replace(/[?？!！。．,，、;；]+$/g, '')
-    .replace(/^(是|像|例如|比如|就是)\s*/i, '')
-    .trim();
-
-  if (!trimmed) return undefined;
-  const normalized = trimmed.toLowerCase().replace(/\s+/g, '');
-
-  if (PROFILE_AMBIGUOUS_VALUE_TOKENS.has(trimmed) || PROFILE_AMBIGUOUS_VALUE_TOKENS.has(normalized)) {
-    return undefined;
-  }
-  if (trimmed.includes('什麼') || trimmed.includes('甚麼') || trimmed.includes('哪些') || trimmed.includes('哪個')) {
-    return undefined;
-  }
-  if (/^(嗎|呢|吧|啊|呀|喔)$/i.test(trimmed)) {
-    return undefined;
-  }
-
-  return trimmed.slice(0, 120);
-};
-
-const sanitizeProfileUpdateFields = (fields: ProfileUpdateFields): ProfileUpdateFields => {
-  const sanitized: ProfileUpdateFields = { ...fields };
-
-  if (typeof sanitized.taboo_to_add === 'string') {
-    const value = normalizeProfileListValue(sanitized.taboo_to_add);
-    if (value) {
-      sanitized.taboo_to_add = value;
-    } else {
-      delete sanitized.taboo_to_add;
-    }
-  }
-
-  if (typeof sanitized.disease_to_add === 'string') {
-    const value = normalizeProfileListValue(sanitized.disease_to_add);
-    if (value) {
-      sanitized.disease_to_add = value;
-    } else {
-      delete sanitized.disease_to_add;
-    }
-  }
-
-  return sanitized;
-};
-
-const buildApprovalProposalItems = (fields: ProfileUpdateFields): ApprovalProposalItem[] => {
-  const keys = Object.keys(PROFILE_UPDATE_META) as ProfileUpdateFieldKey[];
-  const items: ApprovalProposalItem[] = [];
-
-  for (const key of keys) {
-    const rawValue = fields[key];
-    if (rawValue == null) continue;
-
-    let value: string | number | undefined;
-    if (typeof rawValue === 'string') {
-      const trimmed = rawValue.trim();
-      if (!trimmed) continue;
-      value = trimmed;
-    } else if (typeof rawValue === 'number') {
-      value = rawValue;
-    } else {
-      continue;
-    }
-
-    const meta = PROFILE_UPDATE_META[key];
-    items.push({
-      field: key,
-      label: meta.label,
-      action: meta.action,
-      value,
-    });
-  }
-
-  return items;
-};
-
-const formatProfileUpdateSummary = (fields: ProfileUpdateFields): string => {
-  return buildApprovalProposalItems(fields)
-    .map((item) => `${item.action === 'add' ? '新增' : '設定'}${item.label} -> ${item.value}`)
-    .join('\n');
-};
 
 const normalizeUserContext = (rawContext: ChatRequestPayload['user_context']): string[] => {
   if (rawContext == null) return [];
@@ -828,6 +114,12 @@ const normalizeUserContext = (rawContext: ChatRequestPayload['user_context']): s
       }
     })
     .filter((item) => item.length > 0);
+};
+
+const extractUrls = (text: string): string[] => {
+  const matches = text.match(/https?:\/\/[^\s)]+/gi);
+  if (!matches) return [];
+  return matches.map((item) => item.trim());
 };
 
 const normalizeTitle = (value: string, fallbackText: string): string => {
@@ -1047,6 +339,15 @@ const formatUserProfileContext = (raw: string, userId?: string): string => {
   }
 };
 
+const cleanupExpiredUserProfileCache = () => {
+  const now = Date.now();
+  for (const [userId, item] of userProfileCache.entries()) {
+    if (item.expiresAt <= now) {
+      userProfileCache.delete(userId);
+    }
+  }
+};
+
 const fetchUserProfileContext = async (userId?: string): Promise<string> => {
   if (!userId) {
     return 'No user_id provided, skip profile lookup.';
@@ -1078,121 +379,10 @@ const fetchUserProfileContext = async (userId?: string): Promise<string> => {
   }
 };
 
-const runAgentStream = async (
-  res: Response,
-  config: { configurable: { thread_id: string } },
-  input: {
-    messages: Array<{ role: 'user'; content: string }>;
-    user_id: string;
-    room_id: string;
-    user_profile_context: string;
-    image_path: string;
-  }
-): Promise<{
-  finalText: string;
-  toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }>;
-  approvalProposals: ProfileUpdateFields[];
-}> => {
-  const stream = agentApp.streamEvents(input, { ...config, version: 'v2' });
-  const textByMessageId = new Map<string, string>();
-  const toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }> = [];
-  const approvalProposals: ProfileUpdateFields[] = [];
-  let latestMessageId: string | null = null;
-  let fallbackText = '';
-
-  for await (const event of stream) {
-    if (event.event === 'on_chat_model_stream') {
-      const content = getChunkText(event.data.chunk?.content);
-      if (!content) continue;
-
-      const chunkId = event.data.chunk?.id;
-      if (typeof chunkId === 'string' && chunkId.length > 0) {
-        const prev = textByMessageId.get(chunkId) || '';
-        const next = content.startsWith(prev) ? content : `${prev}${content}`;
-        textByMessageId.set(chunkId, next);
-        latestMessageId = chunkId;
-      } else {
-        const next = content.startsWith(fallbackText) ? content : `${fallbackText}${content}`;
-        fallbackText = next;
-      }
-    } else if (event.event === 'on_tool_start') {
-      const toolName = event.name || 'unknown_tool';
-      toolTraces.push({ name: toolName, status: 'running' });
-      sendSSE(res, { type: 'status', content: `Tool ${toolName}: running` });
-    } else if (event.event === 'on_tool_end') {
-      const toolName = event.name || 'unknown_tool';
-      const toolOutput = (event.data as { output?: unknown } | undefined)?.output;
-      const resultPreview = toStatusText(toolOutput);
-      const traceIndex = [...toolTraces]
-        .reverse()
-        .findIndex((trace) => trace.name === toolName && trace.status === 'running');
-
-      if (traceIndex >= 0) {
-        const actualIndex = toolTraces.length - 1 - traceIndex;
-        toolTraces[actualIndex] = { name: toolName, status: 'success', result: resultPreview };
-      } else {
-        toolTraces.push({ name: toolName, status: 'success', result: resultPreview });
-      }
-
-      sendSSE(res, { type: 'status', content: `Tool ${toolName}: success` });
-      if (resultPreview) {
-        sendSSE(res, { type: 'status', content: `Tool ${toolName} result: ${resultPreview}` });
-      }
-      if (toolName === 'propose_profile_update') {
-        const proposal = parseProfileUpdateProposalOutput(toolOutput);
-        if (proposal) {
-          approvalProposals.push(proposal);
-          sendSSE(res, { type: 'status', content: 'Profile update proposal detected.' });
-        } else {
-          console.warn(
-            `Failed to parse propose_profile_update output: ${toStatusText(toolOutput, 600)}`
-          );
-        }
-      }
-    } else if (event.event === 'on_tool_error') {
-      const toolName = event.name || 'unknown_tool';
-      const errorPreview = toStatusText((event.data as { error?: unknown } | undefined)?.error);
-      const traceIndex = [...toolTraces]
-        .reverse()
-        .findIndex((trace) => trace.name === toolName && trace.status === 'running');
-
-      if (traceIndex >= 0) {
-        const actualIndex = toolTraces.length - 1 - traceIndex;
-        toolTraces[actualIndex] = { name: toolName, status: 'error', result: errorPreview };
-      } else {
-        toolTraces.push({ name: toolName, status: 'error', result: errorPreview });
-      }
-
-      sendSSE(res, { type: 'status', content: `Tool ${toolName}: error` });
-      if (errorPreview) {
-        sendSSE(res, { type: 'status', content: `Tool ${toolName} error: ${errorPreview}` });
-      }
-    }
-  }
-
-  const streamedText = latestMessageId
-    ? textByMessageId.get(latestMessageId) || ''
-    : fallbackText;
-
-  if (streamedText.trim().length > 0) {
-    return { finalText: streamedText, toolTraces, approvalProposals };
-  }
-
-  try {
-    const snapshot = await agentApp.getState(config);
-    const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
-    const recoveredText = getLatestAiTextFromState(stateMessages);
-    if (recoveredText.length > 0) {
-      return { finalText: recoveredText, toolTraces, approvalProposals };
-    }
-  } catch (stateError) {
-    console.error('Failed to recover final assistant text from state:', stateError);
-  }
-
-  return { finalText: '', toolTraces, approvalProposals };
+const sendSSE = (res: Response, data: object) => {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
 };
 
-// --- API Router ---
 export const chatHandler = async (req: Request, res: Response) => {
   const requestId = String(res.locals.requestId || createRequestId());
   const parsedBody = ChatRequestSchema.safeParse(req.body);
@@ -1248,6 +438,13 @@ export const chatHandler = async (req: Request, res: Response) => {
       ? 'Please analyze this image and explain the key details.'
       : 'Please help me with this request.';
 
+  const urlsInMessage = extractUrls(effectiveUserMessage);
+  const firstUrl = urlsInMessage.length > 0 ? urlsInMessage[0] : '';
+  const hasMultipleUrls = urlsInMessage.length > 1;
+  const effectiveMessageForAgent = hasMultipleUrls && firstUrl
+    ? `${effectiveUserMessage}\n\n[System note: multiple URLs detected. Only verify the first URL in this request: ${firstUrl}]`
+    : effectiveUserMessage;
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -1257,6 +454,15 @@ export const chatHandler = async (req: Request, res: Response) => {
   try {
     console.log(`[REQ ${requestId}] /api/chat agent start`);
     console.log(`[REQ ${requestId}] /api/chat user_message="${effectiveUserMessage}"`);
+    if (hasMultipleUrls && firstUrl) {
+      console.log(
+        `[REQ ${requestId}] /api/chat multiple URLs detected; only first URL will be verified: ${firstUrl}`
+      );
+      sendSSE(res, {
+        type: 'status',
+        content: `Detected multiple URLs. This turn verifies only the first URL: ${firstUrl}`,
+      });
+    }
     sendSSE(res, { type: 'status', content: 'AI is preparing your response...' });
     sendSSE(res, { type: 'status', content: `User message: ${effectiveUserMessage}` });
 
@@ -1291,7 +497,7 @@ export const chatHandler = async (req: Request, res: Response) => {
 
     const streamResult = await withTimeout(
       runAgentStream(res, config, {
-        messages: [{ role: 'user', content: effectiveUserMessage }],
+        messages: [{ role: 'user', content: effectiveMessageForAgent }],
         user_id: normalizedUserId || 'guest_user',
         room_id: payload.thread_id,
         user_profile_context: combinedContext,
@@ -1344,7 +550,6 @@ export const chatHandler = async (req: Request, res: Response) => {
           createdAt: Date.now(),
           expiresAt: Date.now() + PENDING_APPROVAL_TTL_MS,
         });
-        pendingApprovalByThread.set(payload.thread_id, currentApprovalId);
 
         sendSSE(res, {
           type: 'interrupt',

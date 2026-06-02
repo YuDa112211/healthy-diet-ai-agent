@@ -3,8 +3,10 @@ import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { z } from 'zod';
 import { load } from 'cheerio';
+import net from 'net';
 
 const DEFAULT_TIMEOUT_MS = 8000;
+const DEFAULT_VERIFY_TIMEOUT_MS = 6000;
 const DEFAULT_MAX_CHARS = 18000;
 const DEFAULT_CHUNK_SIZE = 3000;
 const DEFAULT_MAX_CHUNKS = 6;
@@ -13,6 +15,51 @@ const DEFAULT_FINAL_MAX_TOKENS = 520;
 
 const normalizeWhitespace = (value: string): string =>
   value.replace(/\s+/g, ' ').trim();
+
+const isPrivateOrLocalHostname = (hostname: string): boolean => {
+  const lower = hostname.toLowerCase();
+  if (lower === 'localhost' || lower.endsWith('.local')) return true;
+
+  const ipType = net.isIP(hostname);
+  if (!ipType) return false;
+
+  if (ipType === 4) {
+    const parts = hostname.split('.').map((item) => Number(item));
+    if (parts.length !== 4 || parts.some((item) => Number.isNaN(item))) return true;
+    const a = parts[0] ?? -1;
+    const b = parts[1] ?? -1;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+
+  // IPv6 local/private ranges and loopback
+  const normalized = lower.replace(/^\[|\]$/g, '');
+  if (normalized === '::1') return true;
+  if (normalized.startsWith('fe80:')) return true; // link-local
+  if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true; // unique local
+  return false;
+};
+
+const validateSafeWebUrl = (rawUrl: string): { ok: true; normalizedUrl: string } | { ok: false; reason: string } => {
+  try {
+    const parsed = new URL(rawUrl);
+    const protocol = parsed.protocol.toLowerCase();
+    if (protocol !== 'http:' && protocol !== 'https:') {
+      return { ok: false, reason: `Unsupported protocol: ${parsed.protocol}` };
+    }
+    if (isPrivateOrLocalHostname(parsed.hostname)) {
+      return { ok: false, reason: `Blocked private/local target: ${parsed.hostname}` };
+    }
+    return { ok: true, normalizedUrl: parsed.toString() };
+  } catch {
+    return { ok: false, reason: 'Invalid URL format.' };
+  }
+};
 
 const toContentText = (content: unknown): string => {
   if (typeof content === 'string') return content;
@@ -105,6 +152,67 @@ const summarizeFinal = async (
   return toContentText(response.content).trim();
 };
 
+export const checkWebPageTool = tool(
+  async ({
+    url,
+    timeoutMs = DEFAULT_VERIFY_TIMEOUT_MS,
+    maxHtmlChars = 120000
+  }) => {
+    const safeUrl = validateSafeWebUrl(url);
+    if (!safeUrl.ok) {
+      return `URL blocked: ${safeUrl.reason}`;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(safeUrl.normalizedUrl, { signal: controller.signal, redirect: 'follow' });
+      const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+
+      let pageTitle: string | null = null;
+      if (contentType.includes('text/html')) {
+        const html = await response.text();
+        const clippedHtml = html.slice(0, maxHtmlChars);
+        const $ = load(clippedHtml);
+        const rawTitle = normalizeWhitespace($('title').first().text());
+        pageTitle = rawTitle.length > 0 ? rawTitle : null;
+      }
+
+      return JSON.stringify(
+        {
+          input_url: url,
+          final_url: response.url || url,
+          ok: response.ok,
+          status: response.status,
+          status_text: response.statusText,
+          content_type: contentType || null,
+          title: pageTitle
+        },
+        null,
+        2
+      );
+    } catch (error: any) {
+      if (error?.name === 'AbortError') {
+        return `Quick check timeout after ${timeoutMs}ms (${safeUrl.normalizedUrl})`;
+      }
+      return `Quick check error: ${error?.message ?? String(error)}`;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+  {
+    name: 'check_web_page',
+    description:
+      'Quickly verify a URL reachability/status/final URL/title without heavy summarization.',
+    schema: z.object({
+      url: z.string().url().describe('Target webpage URL'),
+      timeoutMs: z.number().int().min(1000).max(15000).optional().default(DEFAULT_VERIFY_TIMEOUT_MS),
+      maxHtmlChars: z.number().int().min(5000).max(300000).optional().default(120000)
+    })
+  }
+);
+
 export const fetchWebPageTool = tool(
   async ({
     url,
@@ -115,18 +223,23 @@ export const fetchWebPageTool = tool(
     summaryMaxTokens = DEFAULT_SUMMARY_MAX_TOKENS,
     finalMaxTokens = DEFAULT_FINAL_MAX_TOKENS
   }) => {
+    const safeUrl = validateSafeWebUrl(url);
+    if (!safeUrl.ok) {
+      return `URL blocked: ${safeUrl.reason}`;
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const response = await fetch(url, { signal: controller.signal });
+      const response = await fetch(safeUrl.normalizedUrl, { signal: controller.signal });
       if (!response.ok) {
-        return `Fetch failed: ${response.status} ${response.statusText} (${url})`;
+        return `Fetch failed: ${response.status} ${response.statusText} (${safeUrl.normalizedUrl})`;
       }
 
       const contentType = response.headers.get('content-type') ?? '';
       if (!contentType.toLowerCase().includes('text/html')) {
-        return `Unsupported content-type: ${contentType || 'unknown'} (${url})`;
+        return `Unsupported content-type: ${contentType || 'unknown'} (${safeUrl.normalizedUrl})`;
       }
 
       const html = await response.text();
@@ -160,7 +273,7 @@ export const fetchWebPageTool = tool(
         chunkSummaries.push(chunkSummary);
       }
 
-      const mergedSummary = await summarizeFinal(finalLlm, pageTitle, url, chunkSummaries);
+      const mergedSummary = await summarizeFinal(finalLlm, pageTitle, safeUrl.normalizedUrl, chunkSummaries);
 
       return JSON.stringify(
         {
@@ -184,7 +297,7 @@ export const fetchWebPageTool = tool(
       );
     } catch (error: any) {
       if (error?.name === 'AbortError') {
-        return `Fetch timeout after ${timeoutMs}ms (${url})`;
+        return `Fetch timeout after ${timeoutMs}ms (${safeUrl.normalizedUrl})`;
       }
       return `Fetch pipeline error: ${error?.message ?? String(error)}`;
     } finally {

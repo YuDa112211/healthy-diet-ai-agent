@@ -1,3 +1,6 @@
 .env
 node_modules/
 bun.lock
+AGENT.md
+.tmp*
+knowledge_base/mohw_clarifications/

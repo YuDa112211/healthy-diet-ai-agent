@@ -235,6 +235,8 @@ export const updateUserProfileTool = tool(
     gender_to_set,
     taboo_to_add,
     disease_to_add,
+    taboo_to_remove,
+    disease_to_remove,
   }) => {
     try {
       const { client, error: configError } = getSupabaseOrError();
@@ -252,11 +254,26 @@ export const updateUserProfileTool = tool(
 
       if (fetchErr) return `Failed to fetch user profile: ${fetchErr.message}`;
 
-      const currentTaboo = Array.isArray(user.taboo) ? [...user.taboo] : [];
-      const currentDisease = Array.isArray(user.disease) ? [...user.disease] : [];
+      let currentTaboo = Array.isArray(user.taboo)
+        ? user.taboo
+            .map((item) => (typeof item === 'string' ? item.trim() : ''))
+            .filter((item) => item.length > 0)
+        : [];
+      let currentDisease = Array.isArray(user.disease)
+        ? user.disease
+            .map((item) => (typeof item === 'string' ? item.trim() : ''))
+            .filter((item) => item.length > 0)
+        : [];
 
-      if (taboo_to_add && !currentTaboo.includes(taboo_to_add)) currentTaboo.push(taboo_to_add);
-      if (disease_to_add && !currentDisease.includes(disease_to_add)) currentDisease.push(disease_to_add);
+      const tabooToAdd = typeof taboo_to_add === 'string' ? taboo_to_add.trim() : '';
+      const diseaseToAdd = typeof disease_to_add === 'string' ? disease_to_add.trim() : '';
+      const tabooToRemove = typeof taboo_to_remove === 'string' ? taboo_to_remove.trim() : '';
+      const diseaseToRemove = typeof disease_to_remove === 'string' ? disease_to_remove.trim() : '';
+
+      if (tabooToAdd && !currentTaboo.includes(tabooToAdd)) currentTaboo.push(tabooToAdd);
+      if (diseaseToAdd && !currentDisease.includes(diseaseToAdd)) currentDisease.push(diseaseToAdd);
+      if (tabooToRemove) currentTaboo = currentTaboo.filter((item) => item !== tabooToRemove);
+      if (diseaseToRemove) currentDisease = currentDisease.filter((item) => item !== diseaseToRemove);
 
       const updatePayload: Record<string, unknown> = {};
 
@@ -269,7 +286,7 @@ export const updateUserProfileTool = tool(
       if (typeof age_to_set === 'number') updatePayload.age = age_to_set;
       if (gender_to_set && gender_to_set.trim().length > 0) updatePayload.gender = gender_to_set.trim();
 
-      if (taboo_to_add || disease_to_add) {
+      if (tabooToAdd || diseaseToAdd || tabooToRemove || diseaseToRemove) {
         updatePayload.taboo = currentTaboo;
         updatePayload.disease = currentDisease;
       }
@@ -310,7 +327,7 @@ export const updateUserProfileTool = tool(
   {
     name: 'update_user_profile',
     description:
-      'Update user profile fields. Supports nickname/avatar_url/height/weight/age/gender set, and taboo/disease append.',
+      'Update user profile fields. Supports nickname/avatar_url/height/weight/age/gender set, and taboo/disease add or remove.',
     schema: z.object({
       user_id: z.string().describe('User UUID'),
       nickname_to_set: z.string().optional().describe('Set user nickname'),
@@ -321,6 +338,8 @@ export const updateUserProfileTool = tool(
       gender_to_set: z.string().optional().describe('Set gender text'),
       taboo_to_add: z.string().optional().describe('Append one taboo item if not exists'),
       disease_to_add: z.string().optional().describe('Append one disease item if not exists'),
+      taboo_to_remove: z.string().optional().describe('Remove one taboo item if exists'),
+      disease_to_remove: z.string().optional().describe('Remove one disease item if exists'),
     }),
   }
 );

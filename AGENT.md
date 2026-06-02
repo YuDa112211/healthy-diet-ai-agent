@@ -35,11 +35,11 @@
 - Request logging / body 限制：`src/serverHandlers.ts`
 - 圖片解析與落地：`src/serverHandlers.ts` (`saveIncomingImageToWorkspace`)
 - Agent workflow：`src/serverHandlers.ts` (`agentTools`, `workflow`, `runAgentStream`)
-- 影像辨識：`agent_skills/vision_analyzer/vision_model.ts`
-- 營養估算：`agent_skills/calorie_calculator/calc_tools.ts`
-- 知識庫讀寫：`agent_skills/admin_knowledge/file_tools.ts`
-- 聊天摘要：`agent_skills/memory_summarizer/summarizer_tools.ts`
-- Supabase 操作：`agent_skills/supabase_logger/db_tools.ts`
+- 影像辨識：`agent_skills/vision_model.ts`
+- 營養估算：`agent_skills/calc_tools.ts`
+- 知識庫讀寫：`agent_skills/file_tools.ts`
+- 聊天摘要：`agent_skills/summarizer_tools.ts`
+- Supabase 操作：`agent_skills/db_tools.ts`
 
 ## 5. Agent 工具註冊現況
 
@@ -72,7 +72,7 @@
 
 1. 新增路由：掛載在 `src/index.ts`，實作放 `src/serverHandlers.ts`（或拆新模組）。
 2. 路由 contract 變更：同步更新 `Doc/api_route_input_output_spec.md`。
-3. 新增 Agent 能力：實作於 `agent_skills/<feature>/`，並在 `agentTools` 註冊。
+3. 新增 Agent 能力：實作於 `agent_skills/*.ts`，並在 `agentTools` 註冊。
 4. 個資寫入不可繞過核准流程。
 
 ## 8. 編碼與亂碼避免（重要）
