@@ -1,6 +1,7 @@
 {
   "scripts": {
     "dev": "bun ./src",
+    "start": "bun ./src",
     "sync:mohw": "bun scripts/sync-mohw-clarifications.ts"
   },
   "dependencies": {

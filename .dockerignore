@@ -1,0 +1,13 @@
+.env
+.git
+.gitignore
+node_modules
+Doc
+.tmp*
+compose.yml
+docker-compose.yml
+package-lock.json
+README.md
+users_images/**
+knowledge_base/uploads/**
+knowledge_base/ingested_markdown/**
