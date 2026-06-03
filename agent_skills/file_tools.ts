@@ -24,6 +24,11 @@ const SEARCH_CACHE_TTL_MS = Number(process.env.KNOWLEDGE_SEARCH_CACHE_TTL_MS || 
 let cacheExpiresAt = 0;
 let cachedChunks: KnowledgeChunk[] = [];
 
+export const invalidateKnowledgeSearchCache = (): void => {
+  cacheExpiresAt = 0;
+  cachedChunks = [];
+};
+
 const ensureDir = (dir: string): void => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -105,6 +110,12 @@ const extractTitle = (markdown: string, fallback: string): string => {
   return title.length > 0 ? title : fallback;
 };
 
+const readFrontMatterValue = (markdown: string, fieldName: string): string | null => {
+  const match = markdown.match(new RegExp(`^- ${fieldName}:\\s*(.+)$`, 'm'));
+  const value = normalizeWhitespace(match?.[1] || '');
+  return value.length > 0 ? value : null;
+};
+
 const parsePublishedDate = (markdown: string, absolutePath?: string): string | null => {
   const lineDate = markdown.match(/^- date:\s*(.+)$/m)?.[1];
   if (lineDate) {
@@ -162,14 +173,16 @@ const buildCorpus = (): KnowledgeChunk[] => {
   for (const absolutePath of ingestedFiles) {
     const markdown = readTextFileSafe(absolutePath);
     if (!markdown) continue;
+    const sourcePath = readFrontMatterValue(markdown, 'source_path') || toPosixRelative(absolutePath);
+    const sourceName = path.basename(sourcePath);
     const title = extractTitle(markdown, path.basename(absolutePath));
     const parts = splitIntoParagraphChunks(markdown, 900);
     for (let i = 0; i < parts.length; i += 1) {
       chunks.push({
-        chunkId: `uploaded_knowledge:${path.basename(absolutePath)}:${i}`,
+        chunkId: `uploaded_knowledge:${sourceName}:${i}`,
         sourceType: 'uploaded_knowledge',
         title,
-        sourcePath: toPosixRelative(absolutePath),
+        sourcePath,
         publishedDate: null,
         content: parts[i] || '',
       });

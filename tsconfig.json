@@ -25,4 +25,5 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false,
   },
+  "exclude": ["**/*.test.ts"]
 }

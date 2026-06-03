@@ -4,6 +4,7 @@ import {
   knowledgeJobStatusHandler,
   uploadKnowledgeHandler,
 } from './server/knowledgeIngestion';
+import { createRagApiRouter } from './server/ragDocuments';
 import {
   syncMohwNews,
   getMohwNewsByIdHandler,
@@ -43,6 +44,7 @@ app.use(jsonBodyParser);
 app.use(urlencodedBodyParser);
 app.use(requestLoggerMiddleware);
 app.use('/images', imagesStaticMiddleware);
+app.use(createRagApiRouter());
 
 app.post('/api/chat', chatHandler);
 app.post('/api/approve', approveHandler);
