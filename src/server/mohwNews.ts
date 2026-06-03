@@ -4,7 +4,6 @@ import path from 'node:path';
 import type { Request, Response } from 'express';
 
 const LIST_URL = 'https://www.fda.gov.tw/tc/news.aspx?cid=5049';
-const SITE_ORIGIN = 'https://www.fda.gov.tw';
 const OUTPUT_DIR = path.resolve(process.cwd(), 'knowledge_base/mohw_clarifications');
 const ARTICLES_DIR = path.join(OUTPUT_DIR, 'articles');
 const MANIFEST_PATH = path.join(OUTPUT_DIR, 'manifest.json');
@@ -99,7 +98,7 @@ const fetchHtml = async (url: string): Promise<string> => {
 };
 
 const parseList = (
-  html: string
+  html: string,
 ): Array<{ id: string; title: string; sourceUrl: string; publishedDate: string | null }> => {
   const $ = load(html);
   const items: Array<{ id: string; title: string; sourceUrl: string; publishedDate: string | null }> = [];
@@ -133,7 +132,7 @@ const sanitizeContentBlock = (text: string): string => {
     text
       .replace(/瀏覽人次[:：]\s*\d+.*$/g, '')
       .replace(/資訊內容對您是否有幫助[:：].*$/g, '')
-      .replace(/驗證碼[:：].*$/g, '')
+      .replace(/驗證碼[:：].*$/g, ''),
   );
 };
 
@@ -171,23 +170,12 @@ const extractContent = (html: string): string => {
     .filter((text) => isUsefulContentBlock(text));
   if (paragraphs.length > 0) return paragraphs.join('\n\n');
 
-  const body = normalizeContentText($('body').text());
+  const body = sanitizeContentBlock($('body').text());
   return body || '(content unavailable)';
 };
 
 const createMarkdown = (record: ArticleRecord, content: string): string => {
-  return [
-    `# ${record.title}`,
-    '',
-    `- id: ${record.id}`,
-    `- date: ${record.publishedDate || 'N/A'}`,
-    `- source: ${record.sourceUrl}`,
-    `- fetchedAt: ${record.fetchedAt}`,
-    '',
-    '## 內文',
-    content,
-    '',
-  ].join('\n');
+  return [`# ${record.title}`, '', '## 內文', content, ''].join('\n');
 };
 
 const looksLikeErrorPage = (content: string): boolean =>
@@ -203,11 +191,17 @@ const looksLikeLowValueContent = (content: string): boolean => {
   return false;
 };
 
+const hasLegacyMetadataBlock = (content: string): boolean =>
+  /^- id:\s*/m.test(content) ||
+  /^- date:\s*/m.test(content) ||
+  /^- source:\s*/m.test(content) ||
+  /^- fetchedAt:\s*/m.test(content);
+
 const hasUsableLocalContent = async (record: ArticleRecord): Promise<boolean> => {
   try {
     const absPath = path.resolve(process.cwd(), record.localPath);
     const content = await readFile(absPath, 'utf8');
-    return !looksLikeLowValueContent(content);
+    return !looksLikeLowValueContent(content) && !hasLegacyMetadataBlock(content);
   } catch {
     return false;
   }

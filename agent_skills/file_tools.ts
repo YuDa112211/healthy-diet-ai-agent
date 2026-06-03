@@ -105,16 +105,20 @@ const extractTitle = (markdown: string, fallback: string): string => {
   return title.length > 0 ? title : fallback;
 };
 
-const parsePublishedDate = (markdown: string): string | null => {
+const parsePublishedDate = (markdown: string, absolutePath?: string): string | null => {
   const lineDate = markdown.match(/^- date:\s*(.+)$/m)?.[1];
   if (lineDate) {
     const normalized = normalizeWhitespace(lineDate);
     if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(normalized)) return normalized;
   }
-  const legacyDate = markdown.match(/公布時間（西元）:\s*(\d{4}-\d{1,2}-\d{1,2})/);
-  if (legacyDate?.[1]) return legacyDate[1];
-  const fileDate = markdown.match(/^#\s+(\d{4}-\d{1,2}-\d{1,2})/m)?.[1];
-  return fileDate || null;
+
+  if (absolutePath) {
+    const fileDate = path.basename(absolutePath).match(/^(\d{4}-\d{2}-\d{2})_\d+\.md$/)?.[1];
+    if (fileDate) return fileDate;
+  }
+
+  const fileDateInTitle = markdown.match(/^#\s+(\d{4}-\d{1,2}-\d{1,2})/m)?.[1];
+  return fileDateInTitle || null;
 };
 
 const buildCorpus = (): KnowledgeChunk[] => {
@@ -130,7 +134,7 @@ const buildCorpus = (): KnowledgeChunk[] => {
         title: extractTitle(markdown, 'Nutrition Rules'),
         sourcePath: toPosixRelative(RULES_FILE_PATH),
         publishedDate: null,
-        content: parts[i] || ''
+        content: parts[i] || '',
       });
     }
   }
@@ -140,7 +144,7 @@ const buildCorpus = (): KnowledgeChunk[] => {
     const markdown = readTextFileSafe(absolutePath);
     if (!markdown) continue;
     const title = extractTitle(markdown, path.basename(absolutePath));
-    const publishedDate = parsePublishedDate(markdown);
+    const publishedDate = parsePublishedDate(markdown, absolutePath);
     const parts = splitIntoParagraphChunks(markdown, 900);
     for (let i = 0; i < parts.length; i += 1) {
       chunks.push({
@@ -149,7 +153,7 @@ const buildCorpus = (): KnowledgeChunk[] => {
         title,
         sourcePath: toPosixRelative(absolutePath),
         publishedDate,
-        content: parts[i] || ''
+        content: parts[i] || '',
       });
     }
   }
@@ -167,7 +171,7 @@ const buildCorpus = (): KnowledgeChunk[] => {
         title,
         sourcePath: toPosixRelative(absolutePath),
         publishedDate: null,
-        content: parts[i] || ''
+        content: parts[i] || '',
       });
     }
   }
@@ -221,9 +225,9 @@ const scoreChunk = (chunk: KnowledgeChunk, query: string, keywords: string[]): n
   if (queryLower.length > 3 && titleLower.includes(queryLower)) score += 8;
 
   if (chunk.sourceType === 'mohw_news' && chunk.publishedDate) {
-    const d = Date.parse(`${chunk.publishedDate}T00:00:00Z`);
-    if (Number.isFinite(d)) {
-      const ageDays = (Date.now() - d) / (24 * 60 * 60 * 1000);
+    const dateValue = Date.parse(`${chunk.publishedDate}T00:00:00Z`);
+    if (Number.isFinite(dateValue)) {
+      const ageDays = (Date.now() - dateValue) / (24 * 60 * 60 * 1000);
       if (ageDays <= 7) score += 3;
       else if (ageDays <= 30) score += 2;
       else if (ageDays <= 90) score += 1;
@@ -249,7 +253,7 @@ const findKnowledge = (input: {
     .filter((chunk) => (allowed ? allowed.has(chunk.sourceType) : true))
     .map((chunk) => ({
       chunk,
-      score: scoreChunk(chunk, query, keywords)
+      score: scoreChunk(chunk, query, keywords),
     }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
@@ -262,7 +266,7 @@ const findKnowledge = (input: {
     source_path: item.chunk.sourcePath,
     published_date: item.chunk.publishedDate,
     score: item.score,
-    snippet: item.chunk.content.slice(0, 450)
+    snippet: item.chunk.content.slice(0, 450),
   }));
 };
 
@@ -277,8 +281,8 @@ export const readKnowledgeTool = tool(
   {
     name: 'read_knowledge_tool',
     description: 'Read local nutrition rules markdown content.',
-    schema: z.object({})
-  }
+    schema: z.object({}),
+  },
 );
 
 export const updateKnowledgeTool = tool(
@@ -286,6 +290,7 @@ export const updateKnowledgeTool = tool(
     if (!RULES_FILE_PATH.startsWith(KNOWLEDGE_BASE_DIR)) {
       return 'Blocked by path safety rule.';
     }
+
     if (overwrite) {
       fs.writeFileSync(RULES_FILE_PATH, newRules, 'utf8');
     } else {
@@ -293,6 +298,7 @@ export const updateKnowledgeTool = tool(
       const next = `${current}\n\n${newRules}`.trim();
       fs.writeFileSync(RULES_FILE_PATH, next, 'utf8');
     }
+
     cacheExpiresAt = 0;
     return overwrite
       ? 'Knowledge rules overwritten successfully.'
@@ -303,9 +309,9 @@ export const updateKnowledgeTool = tool(
     description: 'Update local nutrition rules markdown file.',
     schema: z.object({
       newRules: z.string().min(1).describe('Markdown content to write or append.'),
-      overwrite: z.boolean().describe('If true, replace entire file; otherwise append.')
-    })
-  }
+      overwrite: z.boolean().describe('If true, replace entire file; otherwise append.'),
+    }),
+  },
 );
 
 export const searchKnowledgeTool = tool(
@@ -314,12 +320,13 @@ export const searchKnowledgeTool = tool(
       query,
       topK: top_k,
       sourceTypes: source_types as SourceType[] | undefined,
-      forceRefresh: force_refresh
+      forceRefresh: force_refresh,
     });
+
     return JSON.stringify({
       query,
       total_hits: hits.length,
-      hits
+      hits,
     });
   },
   {
@@ -333,7 +340,7 @@ export const searchKnowledgeTool = tool(
         .array(z.enum(['nutrition_rules', 'mohw_news', 'uploaded_knowledge']))
         .optional()
         .describe('Optional source filter.'),
-      force_refresh: z.boolean().optional().default(false)
-    })
-  }
+      force_refresh: z.boolean().optional().default(false),
+    }),
+  },
 );
