@@ -8,6 +8,10 @@ const SITE_ORIGIN = 'https://www.fda.gov.tw';
 const OUTPUT_DIR = path.resolve(process.cwd(), 'knowledge_base/mohw_clarifications');
 const ARTICLES_DIR = path.join(OUTPUT_DIR, 'articles');
 const MANIFEST_PATH = path.join(OUTPUT_DIR, 'manifest.json');
+const ERROR_PAGE_MARKERS = [
+  'The Resource cannot be found.',
+  'The Resource you are lookingfor could haven been removed'
+];
 
 type ArticleRecord = {
   id: string;
@@ -33,9 +37,22 @@ export type MohwSyncResult = {
 
 const normalizeWhitespace = (value: string): string => value.replace(/\s+/g, ' ').trim();
 
+const isFdaHost = (url: URL): boolean => /(^|\.)fda\.gov\.tw$/i.test(url.hostname);
+
+const normalizeFdaUrl = (url: URL): URL => {
+  if (!isFdaHost(url)) return url;
+
+  const pathName = url.pathname.toLowerCase();
+  if ((pathName === '/news.aspx' || pathName === '/newscontent.aspx') && !pathName.startsWith('/tc/')) {
+    url.pathname = `/tc${url.pathname}`;
+  }
+
+  return url;
+};
+
 const toAbsoluteUrl = (href: string): string => {
   try {
-    return new URL(href, SITE_ORIGIN).toString();
+    return normalizeFdaUrl(new URL(href, LIST_URL)).toString();
   } catch {
     return href;
   }
@@ -46,7 +63,31 @@ const fetchHtml = async (url: string): Promise<string> => {
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} ${response.statusText} for ${url}`);
   }
-  return await response.text();
+
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const contentType = response.headers.get('content-type') || '';
+  const resolvedUrl = response.url || url;
+
+  let charset = 'utf-8';
+  const charsetMatch = contentType.match(/charset=([^;]+)/i);
+  if (charsetMatch?.[1]) {
+    charset = charsetMatch[1].trim().toLowerCase();
+  } else {
+    try {
+      const parsedUrl = new URL(resolvedUrl);
+      if (isFdaHost(parsedUrl)) {
+        charset = 'big5';
+      }
+    } catch {
+      // Keep the UTF-8 default when the URL cannot be parsed.
+    }
+  }
+
+  try {
+    return new TextDecoder(charset).decode(bytes);
+  } catch {
+    return new TextDecoder('utf-8').decode(bytes);
+  }
 };
 
 const parseList = (html: string): Array<{ id: string; title: string; sourceUrl: string; publishedDate: string | null }> => {
@@ -98,6 +139,9 @@ const createMarkdown = (record: ArticleRecord, content: string): string => {
   ].join('\n');
 };
 
+const looksLikeErrorPage = (content: string): boolean =>
+  ERROR_PAGE_MARKERS.some((marker) => content.includes(marker));
+
 const readManifest = async (): Promise<Manifest> => {
   try {
     const raw = await readFile(MANIFEST_PATH, 'utf8');
@@ -122,7 +166,11 @@ export const syncMohwNews = async (): Promise<MohwSyncResult> => {
 
   for (const item of list) {
     const prev = oldMap.get(item.id);
-    const shouldRefresh = !prev || prev.title !== item.title || prev.publishedDate !== item.publishedDate;
+    const shouldRefresh =
+      !prev ||
+      prev.title !== item.title ||
+      prev.publishedDate !== item.publishedDate ||
+      prev.sourceUrl !== item.sourceUrl;
     if (!shouldRefresh && prev) {
       records.push(prev);
       continue;
@@ -130,6 +178,9 @@ export const syncMohwNews = async (): Promise<MohwSyncResult> => {
 
     const detailHtml = await fetchHtml(item.sourceUrl);
     const content = extractContent(detailHtml);
+    if (looksLikeErrorPage(content)) {
+      throw new Error(`Fetched error page instead of article content for ${item.sourceUrl}`);
+    }
     const fileName = `${item.publishedDate || 'unknown-date'}_${item.id}.md`;
     const absPath = path.join(ARTICLES_DIR, fileName);
     const relPath = path.relative(process.cwd(), absPath).replace(/\\/g, '/');
