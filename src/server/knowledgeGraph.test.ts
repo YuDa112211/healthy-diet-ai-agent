@@ -137,7 +137,7 @@ describe('createKnowledgeGraphRouter', () => {
   });
 
   test('returns graph search results centered on a nutrition query', async () => {
-    await fetch(`${baseUrl}/api/graph/documents/doc-upload-1/extract`, {
+    await fetch(`${baseUrl}/api/graph/extract-all`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -162,7 +162,7 @@ describe('createKnowledgeGraphRouter', () => {
   });
 
   test('returns node detail with neighbors and evidence', async () => {
-    await fetch(`${baseUrl}/api/graph/documents/doc-upload-1/extract`, {
+    await fetch(`${baseUrl}/api/graph/extract-all`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -189,6 +189,27 @@ describe('createKnowledgeGraphRouter', () => {
     expect(body.evidence.length).toBeGreaterThan(0);
   });
 
+  test('lists all knowledge points from the rebuilt global graph', async () => {
+    await fetch(`${baseUrl}/api/graph/extract-all`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-admin-user-id': 'admin-1',
+        'x-admin-role': 'admin',
+      },
+      body: JSON.stringify({ force: true }),
+    });
+
+    const response = await fetch(`${baseUrl}/api/graph/nodes?limit=50`);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.total).toBeGreaterThan(0);
+    expect(body.items.length).toBeGreaterThan(0);
+    expect(body.items.some((node: { label: string }) => /fiber/i.test(node.label))).toBe(true);
+    expect(body.items.some((node: { label: string }) => /broccoli/i.test(node.label))).toBe(true);
+  });
+
   test('requires forwarded admin identity for extract and document detail routes', async () => {
     const extractResponse = await fetch(`${baseUrl}/api/graph/documents/doc-upload-1/extract`, {
       method: 'POST',
@@ -199,5 +220,36 @@ describe('createKnowledgeGraphRouter', () => {
 
     const detailResponse = await fetch(`${baseUrl}/api/graph/documents/doc-upload-1`);
     expect(detailResponse.status).toBe(401);
+  });
+
+  test('rebuilds the full graph from all current RAG sources and reports status', async () => {
+    const rebuildResponse = await fetch(`${baseUrl}/api/graph/extract-all`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-admin-user-id': 'admin-1',
+        'x-admin-role': 'admin',
+      },
+      body: JSON.stringify({ force: true }),
+    });
+
+    expect(rebuildResponse.status).toBe(200);
+    const rebuildBody = await rebuildResponse.json();
+    expect(rebuildBody.ok).toBe(true);
+    expect(rebuildBody.summary.document_count).toBeGreaterThanOrEqual(3);
+    expect(rebuildBody.summary.node_count).toBeGreaterThan(0);
+    expect(rebuildBody.summary.edge_count).toBeGreaterThan(0);
+
+    const statusResponse = await fetch(`${baseUrl}/api/graph/status`);
+    expect(statusResponse.status).toBe(200);
+    const statusBody = await statusResponse.json();
+    expect(statusBody.ok).toBe(true);
+    expect(statusBody.ready).toBe(true);
+    expect(statusBody.summary.document_count).toBe(rebuildBody.summary.document_count);
+    expect(statusBody.summary.node_count).toBe(rebuildBody.summary.node_count);
+    expect(statusBody.summary.edge_count).toBe(rebuildBody.summary.edge_count);
+    expect(statusBody.summary.source_counts.uploaded_knowledge).toBeGreaterThanOrEqual(1);
+    expect(statusBody.summary.source_counts.nutrition_rules).toBeGreaterThanOrEqual(1);
+    expect(statusBody.summary.source_counts.mohw_news).toBeGreaterThanOrEqual(1);
   });
 });

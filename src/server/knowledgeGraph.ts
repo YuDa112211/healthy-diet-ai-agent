@@ -32,6 +32,12 @@ const RelationParamsSchema = z.object({
   relation_id: z.string().trim().min(1),
 });
 
+const ListNodesSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  node_type: z.string().trim().min(1).optional(),
+  query: z.string().trim().min(1).optional(),
+});
+
 type GraphNodeType = 'food' | 'nutrient' | 'condition' | 'population' | 'guideline' | 'document' | 'topic';
 type GraphRelationType =
   | 'contains'
@@ -90,6 +96,15 @@ type KnowledgeGraphCache = {
   nodes: Record<string, KnowledgeGraphNode>;
   edges: Record<string, KnowledgeGraphEdge>;
   evidence: Record<string, KnowledgeGraphEvidence>;
+};
+
+type KnowledgeGraphSummary = {
+  document_count: number;
+  node_count: number;
+  edge_count: number;
+  evidence_count: number;
+  source_counts: Record<GraphSourceType, number>;
+  generated_at: string | null;
 };
 
 type KnowledgeSourceDocument = {
@@ -564,6 +579,30 @@ const buildNodeDetail = (cache: KnowledgeGraphCache, nodeId: string) => {
   return { node, edges, neighbors, evidence };
 };
 
+const listNodes = (
+  cache: KnowledgeGraphCache,
+  options: z.infer<typeof ListNodesSchema>
+): { total: number; items: KnowledgeGraphNode[] } => {
+  let items = Object.values(cache.nodes);
+
+  if (options.node_type) {
+    items = items.filter((node) => node.node_type === options.node_type);
+  }
+
+  if (options.query) {
+    const lowerQuery = safeLower(options.query);
+    items = items.filter((node) =>
+      [node.label, ...node.aliases].some((value) => safeLower(value).includes(lowerQuery))
+    );
+  }
+
+  items = items.sort((a, b) => a.label.localeCompare(b.label));
+  return {
+    total: items.length,
+    items: items.slice(0, options.limit),
+  };
+};
+
 const findDocumentById = async (
   rootDir: string,
   repository: RagDocumentsRepository | null | undefined,
@@ -575,6 +614,38 @@ const findDocumentById = async (
 
   const locals = await discoverLocalKnowledgeSources(rootDir);
   return locals.find((doc) => doc.id === documentId) ?? null;
+};
+
+const discoverAllKnowledgeSources = async (
+  rootDir: string,
+  repository: RagDocumentsRepository | null | undefined
+): Promise<KnowledgeSourceDocument[]> => {
+  const [uploaded, locals] = await Promise.all([
+    discoverUploadedSources(rootDir, repository),
+    discoverLocalKnowledgeSources(rootDir),
+  ]);
+  return [...uploaded, ...locals];
+};
+
+const summarizeCache = (cache: KnowledgeGraphCache): KnowledgeGraphSummary => {
+  const sourceCounts: Record<GraphSourceType, number> = {
+    uploaded_knowledge: 0,
+    nutrition_rules: 0,
+    mohw_news: 0,
+  };
+
+  for (const document of Object.values(cache.documents)) {
+    sourceCounts[document.source_type] += 1;
+  }
+
+  return {
+    document_count: Object.keys(cache.documents).length,
+    node_count: Object.keys(cache.nodes).length,
+    edge_count: Object.keys(cache.edges).length,
+    evidence_count: Object.keys(cache.evidence).length,
+    source_counts: sourceCounts,
+    generated_at: cache.generated_at || null,
+  };
 };
 
 export const createKnowledgeGraphRouter = (options: RouterOptions = {}): Router => {
@@ -589,6 +660,65 @@ export const createKnowledgeGraphRouter = (options: RouterOptions = {}): Router 
     cache.generated_at = new Date().toISOString();
     await writeJsonFile(cachePath, cache);
   };
+
+  router.post('/api/graph/extract-all', async (req, res, next) => {
+    try {
+      if (!requireAdminIdentity(req, res)) return;
+      const payload = ExtractBodySchema.parse(req.body ?? {});
+      const sources = await discoverAllKnowledgeSources(rootDir, repository);
+      const existingCache = payload.force ? emptyCache() : await readCache();
+      const cache = payload.force ? emptyCache() : existingCache;
+
+      if (payload.force) {
+        for (const document of sources) {
+          const extracted = extractDocumentGraph(cache, document);
+          cache.documents[document.id] = extracted;
+        }
+      } else {
+        const seen = new Set<string>();
+        for (const document of sources) {
+          seen.add(document.id);
+          const contentHash = hashText(document.content);
+          const existing = cache.documents[document.id];
+          if (existing && existing.content_hash === contentHash) {
+            continue;
+          }
+          pruneDocumentFromCache(cache, document.id);
+          const extracted = extractDocumentGraph(cache, document);
+          cache.documents[document.id] = extracted;
+        }
+
+        for (const documentId of Object.keys(cache.documents)) {
+          if (!seen.has(documentId)) {
+            pruneDocumentFromCache(cache, documentId);
+          }
+        }
+      }
+
+      await writeCache(cache);
+      res.json({
+        ok: true,
+        force: payload.force,
+        summary: summarizeCache(cache),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.get('/api/graph/status', async (_req, res, next) => {
+    try {
+      const cache = await readCache();
+      const summary = summarizeCache(cache);
+      res.json({
+        ok: true,
+        ready: summary.document_count > 0,
+        summary,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
 
   router.post('/api/graph/documents/:document_id/extract', async (req, res, next) => {
     try {
@@ -674,6 +804,21 @@ export const createKnowledgeGraphRouter = (options: RouterOptions = {}): Router 
         edges: result.edges,
         evidence: result.evidence,
         documents: result.documents,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.get('/api/graph/nodes', async (req, res, next) => {
+    try {
+      const query = ListNodesSchema.parse(req.query);
+      const cache = await readCache();
+      const result = listNodes(cache, query);
+      res.json({
+        ok: true,
+        total: result.total,
+        items: result.items,
       });
     } catch (error) {
       next(error);
