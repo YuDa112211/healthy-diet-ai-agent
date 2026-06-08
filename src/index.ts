@@ -12,6 +12,7 @@ import {
   listMohwNewsHandler,
   syncMohwNewsHandler,
 } from './server/mohwNews';
+import { createKnowledgeGraphRouter } from './server/knowledgeGraph';
 import { ragSearchHandler } from './server/ragSearch';
 import {
   AI_API_URL,
@@ -45,6 +46,7 @@ app.use(urlencodedBodyParser);
 app.use(requestLoggerMiddleware);
 app.use('/images', imagesStaticMiddleware);
 app.use(createRagApiRouter());
+app.use(createKnowledgeGraphRouter());
 
 app.post('/api/chat', chatHandler);
 app.post('/api/approve', approveHandler);
