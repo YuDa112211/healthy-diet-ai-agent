@@ -663,6 +663,7 @@ export const createKnowledgeGraphRouter = (options: RouterOptions = {}): Router 
 
   router.post('/api/graph/extract-all', async (req, res, next) => {
     try {
+      if (!requireAdminIdentity(req, res)) return;
       const payload = ExtractBodySchema.parse(req.body ?? {});
       const sources = await discoverAllKnowledgeSources(rootDir, repository);
       const existingCache = payload.force ? emptyCache() : await readCache();

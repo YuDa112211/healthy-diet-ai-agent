@@ -141,6 +141,8 @@ describe('createKnowledgeGraphRouter', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
+        'x-admin-user-id': 'admin-1',
+        'x-admin-role': 'admin',
       },
       body: JSON.stringify({ force: true }),
     });
@@ -164,6 +166,8 @@ describe('createKnowledgeGraphRouter', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
+        'x-admin-user-id': 'admin-1',
+        'x-admin-role': 'admin',
       },
       body: JSON.stringify({ force: true }),
     });
@@ -190,6 +194,8 @@ describe('createKnowledgeGraphRouter', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
+        'x-admin-user-id': 'admin-1',
+        'x-admin-role': 'admin',
       },
       body: JSON.stringify({ force: true }),
     });
@@ -221,6 +227,8 @@ describe('createKnowledgeGraphRouter', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
+        'x-admin-user-id': 'admin-1',
+        'x-admin-role': 'admin',
       },
       body: JSON.stringify({ force: true }),
     });
@@ -243,20 +251,5 @@ describe('createKnowledgeGraphRouter', () => {
     expect(statusBody.summary.source_counts.uploaded_knowledge).toBeGreaterThanOrEqual(1);
     expect(statusBody.summary.source_counts.nutrition_rules).toBeGreaterThanOrEqual(1);
     expect(statusBody.summary.source_counts.mohw_news).toBeGreaterThanOrEqual(1);
-  });
-
-  test('allows full graph rebuild without forwarded admin identity', async () => {
-    const response = await fetch(`${baseUrl}/api/graph/extract-all`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({ force: true }),
-    });
-
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body.ok).toBe(true);
-    expect(body.summary.document_count).toBeGreaterThan(0);
   });
 });
