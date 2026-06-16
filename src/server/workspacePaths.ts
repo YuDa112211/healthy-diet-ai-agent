@@ -8,6 +8,7 @@ export const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 10 * 1024 *
 
 export const AGENT_FILE = path.join(KNOWLEDGE_BASE_DIR, 'AGENT.md');
 export const INDEX_FILE = path.join(KNOWLEDGE_BASE_DIR, 'SKILLS_INDEX.md');
+export const LEGACY_INDEX_FILE = path.join(KNOWLEDGE_BASE_DIR, 'SKILL_INDEX.md');
 export const RULES_FILE = path.join(KNOWLEDGE_BASE_DIR, 'NUTRITION_RULES.md');
 
 export const imagesStaticMiddleware = express.static(USERS_IMAGES_DIR);

@@ -11,7 +11,7 @@ import { calculateNutritionTool } from '../../agent_skills/calc_tools';
 import { getChatHistoryTool } from '../../agent_skills/db_tools';
 import { compressChatHistoryTool } from '../../agent_skills/summarizer_tools';
 import { checkWebPageTool, fetchWebPageTool } from '../../agent_skills/fetch_web';
-import { AGENT_FILE, INDEX_FILE, RULES_FILE } from './workspacePaths';
+import { AGENT_FILE, INDEX_FILE, LEGACY_INDEX_FILE, RULES_FILE } from './workspacePaths';
 import { toStatusText } from './httpRuntime';
 import type { ChatModelSource } from './chatPayload';
 import {
@@ -119,6 +119,116 @@ const hasAnalyzeFoodToolResult = (messages: unknown[] | undefined): boolean => {
   });
 };
 
+const getLatestUserTextFromState = (messages: unknown[] | undefined): string => {
+  if (!Array.isArray(messages)) return '';
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (!item || typeof item !== 'object') continue;
+
+    const role = (item as { role?: unknown }).role;
+    if (role !== 'user') continue;
+
+    const content = (item as { content?: unknown }).content;
+    const text = getChunkText(content).trim();
+    if (text.length > 0) return text;
+  }
+
+  return '';
+};
+
+export const isCapabilityQuestion = (message: string): boolean => {
+  const normalized = message.toLowerCase().replace(/\s+/g, '');
+  if (!normalized) return false;
+
+  const capabilityPatterns = [
+    '你有什麼功能',
+    '你有什麼能力',
+    '你會什麼',
+    '你會做什麼',
+    '你能做什麼',
+    '有哪些功能',
+    '有哪些能力',
+    '可以做什麼',
+    '支援什麼',
+    'help',
+    'capabilities',
+    'features',
+    'whatcanyoudo',
+  ];
+
+  return capabilityPatterns.some((pattern) => normalized.includes(pattern));
+};
+
+const hasToolResult = (messages: unknown[] | undefined, toolName: string): boolean => {
+  if (!Array.isArray(messages)) return false;
+
+  return messages.some((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const role = (item as { role?: unknown }).role;
+    const name = (item as { name?: unknown }).name;
+    if (role === 'tool' && name === toolName) return true;
+
+    const lcKwargsName = (item as { lc_kwargs?: { name?: unknown } }).lc_kwargs?.name;
+    return lcKwargsName === toolName;
+  });
+};
+
+const readOptionalFile = (...filePaths: string[]): string => {
+  for (const filePath of filePaths) {
+    if (!fs.existsSync(filePath)) continue;
+    return fs.readFileSync(filePath, 'utf-8');
+  }
+  return '';
+};
+
+const extractSkillDescriptions = (skillsIndex: string): Map<string, string> => {
+  const descriptions = new Map<string, string>();
+  const matches = skillsIndex.matchAll(/`([^`]+)`\s*[:：]\s*([^\r\n]+)/g);
+
+  for (const match of matches) {
+    const toolName = match[1]?.trim();
+    const description = match[2]?.trim();
+    if (!toolName || !description) continue;
+    descriptions.set(toolName, description);
+  }
+
+  return descriptions;
+};
+
+export const buildCapabilitiesSummary = ({
+  toolNames,
+  skillsIndex,
+}: {
+  toolNames: string[];
+  skillsIndex: string;
+}): string => {
+  const descriptions = extractSkillDescriptions(skillsIndex);
+  const lines = toolNames.map((toolName) => {
+    const description = descriptions.get(toolName) || '已註冊可用工具';
+    return `- ${toolName}: ${description}`;
+  });
+
+  return [
+    '請只根據以下已註冊能力回答，不要補充未列出的外部能力。',
+    ...lines,
+  ].join('\n');
+};
+
+const REGISTERED_CAPABILITY_TOOL_NAMES = [
+  'search_knowledge_tool',
+  'read_knowledge_tool',
+  'update_knowledge_tool',
+  'analyze_food_image',
+  'calculate_nutrition',
+  'check_web_page',
+  'fetch_web_page',
+  'get_chat_history',
+  'propose_profile_update',
+  'compress_chat_history',
+  'list_capabilities_tool',
+];
+
 const proposeProfileUpdateTool = tool(
   async ({
     nickname_to_set,
@@ -172,6 +282,23 @@ const proposeProfileUpdateTool = tool(
   }
 );
 
+const listCapabilitiesTool = tool(
+  async () => {
+    const skillsIndex = readOptionalFile(INDEX_FILE, LEGACY_INDEX_FILE);
+
+    return buildCapabilitiesSummary({
+      toolNames: REGISTERED_CAPABILITY_TOOL_NAMES,
+      skillsIndex,
+    });
+  },
+  {
+    name: 'list_capabilities_tool',
+    description:
+      'List the assistant capabilities strictly from currently registered tools and the local skills index. Use this before answering questions about what the assistant can do.',
+    schema: z.object({}),
+  }
+);
+
 const agentTools = [
   searchKnowledgeTool,
   readKnowledgeTool,
@@ -183,6 +310,7 @@ const agentTools = [
   getChatHistoryTool,
   proposeProfileUpdateTool,
   compressChatHistoryTool,
+  listCapabilitiesTool,
 ];
 const toolNode = new ToolNode(agentTools);
 
@@ -274,7 +402,7 @@ const AgentState = Annotation.Root({
 
 const callModel = async (state: typeof AgentState.State) => {
   const agentInstructions = fs.existsSync(AGENT_FILE) ? fs.readFileSync(AGENT_FILE, 'utf-8') : '';
-  const skillsIndex = fs.existsSync(INDEX_FILE) ? fs.readFileSync(INDEX_FILE, 'utf-8') : '';
+  const skillsIndex = readOptionalFile(INDEX_FILE, LEGACY_INDEX_FILE);
   const nutritionRules = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf-8') : '';
 
   const userInfo = state.user_id
@@ -285,7 +413,11 @@ const callModel = async (state: typeof AgentState.State) => {
     : 'Current room id is missing.';
   const userProfileContext = state.user_profile_context || 'No extra user context provided.';
   const imagePath = state.image_path || '';
+  const latestUserText = getLatestUserTextFromState(state.messages as unknown[]);
   const needsImageToolCall = Boolean(imagePath) && !hasAnalyzeFoodToolResult(state.messages as unknown[]);
+  const needsCapabilityToolCall =
+    isCapabilityQuestion(latestUserText) &&
+    !hasToolResult(state.messages as unknown[], 'list_capabilities_tool');
 
   const prompt = [
     agentInstructions,
@@ -316,6 +448,8 @@ const callModel = async (state: typeof AgentState.State) => {
     '--- Response Style ---',
     'Never output raw JSON directly to the user.',
     'If tool outputs JSON, convert it into concise Traditional Chinese explanation.',
+    'If the user asks what you can do, what features you have, or what capabilities are available, call list_capabilities_tool first and answer strictly from that result.',
+    'When describing your capabilities, do not claim any feature that is not present in list_capabilities_tool output or explicit runtime instructions.',
     'For factual health/nutrition/food-safety claims, call search_knowledge_tool first, then answer with cited source_path values.',
     'When search_knowledge_tool returns relevant hits, prioritize those sources and mention uncertainty if evidence is weak.',
     'When dish_name and ingredients exist, summarize dish and estimated calories in plain text.',
@@ -356,8 +490,13 @@ const callModel = async (state: typeof AgentState.State) => {
     invokeProvider: async (provider) => {
       const baseModel =
         provider === 'google' && googleApiKey ? createGoogleChatModel(googleApiKey) : llm;
-      const modelWithTools = needsImageToolCall
-        ? baseModel.bindTools(agentTools, { tool_choice: 'analyze_food_image' })
+      const toolChoice = needsImageToolCall
+        ? 'analyze_food_image'
+        : needsCapabilityToolCall
+          ? 'list_capabilities_tool'
+          : undefined;
+      const modelWithTools = toolChoice
+        ? baseModel.bindTools(agentTools, { tool_choice: toolChoice })
         : baseModel.bindTools(agentTools);
 
       return modelWithTools.invoke([systemMessage, ...recentMessages]);

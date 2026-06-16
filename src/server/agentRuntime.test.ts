@@ -224,3 +224,42 @@ describe('withRuntimeStatusEmitter', () => {
     expect(getRuntimeStatusEmitterCount()).toBe(initialCount);
   });
 });
+
+describe('capability guidance', () => {
+  test('detects capability-related user questions', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const isCapabilityQuestion = getRequiredFunction<
+      (message: string) => boolean
+    >((agentRuntime as Record<string, unknown>).isCapabilityQuestion, 'isCapabilityQuestion');
+
+    expect(isCapabilityQuestion('你有什麼功能？')).toBe(true);
+    expect(isCapabilityQuestion('你會做什麼')).toBe(true);
+    expect(isCapabilityQuestion('請幫我分析今天吃的早餐')).toBe(false);
+  });
+
+  test('builds capability summary from registered tools and skills index text', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const buildCapabilitiesSummary = getRequiredFunction<
+      (input: { toolNames: string[]; skillsIndex: string }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).buildCapabilitiesSummary,
+      'buildCapabilitiesSummary'
+    );
+
+    const summary = buildCapabilitiesSummary({
+      toolNames: ['search_knowledge_tool', 'list_capabilities_tool', 'calculate_nutrition'],
+      skillsIndex: [
+        '# Skills',
+        '- `search_knowledge_tool`: 搜尋知識庫',
+        '- `calculate_nutrition`: 估算營養',
+        '- `internet_search`: 網路搜尋',
+      ].join('\n'),
+    });
+
+    expect(summary).toContain('search_knowledge_tool');
+    expect(summary).toContain('calculate_nutrition');
+    expect(summary).toContain('list_capabilities_tool');
+    expect(summary).not.toContain('internet_search');
+    expect(summary).toContain('搜尋知識庫');
+  });
+});
