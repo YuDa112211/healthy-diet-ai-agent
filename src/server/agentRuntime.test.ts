@@ -263,3 +263,23 @@ describe('capability guidance', () => {
     expect(summary).toContain('搜尋知識庫');
   });
 });
+
+describe('visible text sanitization', () => {
+  test('removes thought blocks from assistant-visible text', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const sanitizeAssistantVisibleText = getRequiredFunction<
+      (message: string) => string
+    >(
+      (agentRuntime as Record<string, unknown>).sanitizeAssistantVisibleText,
+      'sanitizeAssistantVisibleText'
+    );
+
+    const sanitized = sanitizeAssistantVisibleText([
+      '<thought>The list_capabilities_tool returned tools.</thought>',
+      '我目前可以幫你做這些事：',
+      '1. 分析食物照片',
+    ].join('\n\n'));
+
+    expect(sanitized).toBe(['我目前可以幫你做這些事：', '1. 分析食物照片'].join('\n\n'));
+  });
+});

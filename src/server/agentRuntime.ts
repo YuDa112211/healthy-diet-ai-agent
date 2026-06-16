@@ -103,6 +103,17 @@ const getLatestAiTextFromState = (messages: unknown[] | undefined): string => {
   return '';
 };
 
+export const sanitizeAssistantVisibleText = (message: string): string => {
+  if (!message) return '';
+
+  const withoutThoughtBlocks = message.replace(/<thought>[\s\S]*?<\/thought>/gi, '');
+  const withoutSelfClosingThoughts = withoutThoughtBlocks.replace(/<thought\s*\/>/gi, '');
+
+  return withoutSelfClosingThoughts
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+};
+
 const hasAnalyzeFoodToolResult = (messages: unknown[] | undefined): boolean => {
   if (!Array.isArray(messages)) return false;
 
@@ -632,15 +643,16 @@ export const runAgentStream = async (
     const streamedText = latestMessageId
       ? textByMessageId.get(latestMessageId) || ''
       : fallbackText;
+    const sanitizedStreamedText = sanitizeAssistantVisibleText(streamedText);
 
-    if (streamedText.trim().length > 0) {
-      return { finalText: streamedText, toolTraces, approvalProposals };
+    if (sanitizedStreamedText.length > 0) {
+      return { finalText: sanitizedStreamedText, toolTraces, approvalProposals };
     }
 
     try {
       const snapshot = await agentApp.getState(config);
       const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
-      const recoveredText = getLatestAiTextFromState(stateMessages);
+      const recoveredText = sanitizeAssistantVisibleText(getLatestAiTextFromState(stateMessages));
       if (recoveredText.length > 0) {
         return { finalText: recoveredText, toolTraces, approvalProposals };
       }
