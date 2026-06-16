@@ -1,7 +1,6 @@
 import fs from 'fs';
 import type { Response } from 'express';
 import { z } from 'zod';
-import { ChatOpenAI } from '@langchain/openai';
 import { tool } from '@langchain/core/tools';
 import { MemorySaver, StateGraph, START, END, MessagesAnnotation, Annotation } from '@langchain/langgraph';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
@@ -13,8 +12,16 @@ import { getChatHistoryTool } from '../../agent_skills/db_tools';
 import { compressChatHistoryTool } from '../../agent_skills/summarizer_tools';
 import { checkWebPageTool, fetchWebPageTool } from '../../agent_skills/fetch_web';
 import { AGENT_FILE, INDEX_FILE, RULES_FILE } from './workspacePaths';
-import { AI_API_URL } from './supabaseRuntime';
-import { LLM_TIMEOUT_MS, toStatusText } from './httpRuntime';
+import { toStatusText } from './httpRuntime';
+import type { ChatModelSource } from './chatPayload';
+import {
+  buildPreferredProviderOrder,
+  createGoogleChatModel,
+  createLocalChatModel,
+  isRetryableGoogleFailure,
+  pickGoogleApiKey,
+  type ChatProvider,
+} from './modelRouting';
 import {
   hasAnyProfileField,
   parseProfileUpdateProposalOutput,
@@ -24,6 +31,38 @@ import {
 
 const sendSSE = (res: Response, data: object) => {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+};
+
+const runtimeStatusEmitters = new Map<string, (message: string) => void>();
+
+const emitRuntimeStatus = (runtimeStreamId: string | undefined, message: string) => {
+  if (!runtimeStreamId) return;
+  runtimeStatusEmitters.get(runtimeStreamId)?.(message);
+};
+
+export const getRuntimeStatusEmitterCount = (): number => runtimeStatusEmitters.size;
+
+export const withRuntimeStatusEmitter = async <T>({
+  runtimeStreamId,
+  res,
+  work,
+}: {
+  runtimeStreamId: string;
+  res: Pick<Response, 'write'>;
+  work: () => Promise<T> | T;
+}): Promise<T> => {
+  const sentRuntimeStatuses = new Set<string>();
+  runtimeStatusEmitters.set(runtimeStreamId, (message) => {
+    if (sentRuntimeStatuses.has(message)) return;
+    sentRuntimeStatuses.add(message);
+    sendSSE(res as Response, { type: 'status', content: message });
+  });
+
+  try {
+    return await work();
+  } finally {
+    runtimeStatusEmitters.delete(runtimeStreamId);
+  }
 };
 
 const getChunkText = (content: unknown): string => {
@@ -147,14 +186,81 @@ const agentTools = [
 ];
 const toolNode = new ToolNode(agentTools);
 
-export const llm = new ChatOpenAI({
-  modelName: 'gemma',
-  temperature: 0,
-  timeout: LLM_TIMEOUT_MS,
-  maxRetries: 0,
-  configuration: { baseURL: AI_API_URL },
-  apiKey: 'dummy',
+export const llm = createLocalChatModel();
+
+export type AgentModelAttempt = {
+  provider: ChatProvider;
+  reason: 'selected' | 'fallback';
+};
+
+type StructuredOutputModel = {
+  withStructuredOutput: <TSchema extends z.ZodTypeAny>(schema: TSchema) => {
+    invoke: (input: unknown) => Promise<z.infer<TSchema>>;
+  };
+};
+
+export const buildAgentModelAttemptPlan = (
+  modelSource: ChatModelSource,
+  hasGoogleKey: boolean
+): AgentModelAttempt[] => {
+  return buildPreferredProviderOrder(modelSource, hasGoogleKey).map((provider, index) => ({
+    provider,
+    reason: index === 0 ? 'selected' : 'fallback',
+  }));
+};
+
+export const createLocalOnlyStructuredOutputBinder = (
+  model: StructuredOutputModel = llm as unknown as StructuredOutputModel
+) => ({
+  withStructuredOutput: <TSchema extends z.ZodTypeAny>(schema: TSchema) =>
+    model.withStructuredOutput(schema),
 });
+
+export const invokeWithModelRouting = async <T>({
+  modelSource,
+  googleApiKey,
+  onStatus,
+  invokeProvider,
+}: {
+  modelSource: ChatModelSource;
+  googleApiKey?: string;
+  onStatus?: (message: string) => void;
+  invokeProvider: (provider: ChatProvider) => Promise<T>;
+}): Promise<{ provider: ChatProvider; value: T }> => {
+  const attempts = buildAgentModelAttemptPlan(modelSource, Boolean(googleApiKey));
+  const selectedProvider = attempts[0]?.provider;
+
+  if (!selectedProvider) {
+    throw new Error('No chat model provider available.');
+  }
+
+  onStatus?.(`Model selected: ${selectedProvider}`);
+
+  for (let index = 0; index < attempts.length; index += 1) {
+    const currentAttempt = attempts[index];
+    const nextAttempt = attempts[index + 1];
+    if (!currentAttempt) continue;
+
+    try {
+      const value = await invokeProvider(currentAttempt.provider);
+      return { provider: currentAttempt.provider, value };
+    } catch (error) {
+      const shouldFallback =
+        currentAttempt.provider === 'google' &&
+        nextAttempt?.provider === 'local' &&
+        isRetryableGoogleFailure(error);
+
+      if (shouldFallback) {
+        onStatus?.('Google upstream failed, falling back to local model.');
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error('No chat model provider completed successfully.');
+};
 
 const AgentState = Annotation.Root({
   ...MessagesAnnotation.spec,
@@ -162,6 +268,8 @@ const AgentState = Annotation.Root({
   room_id: Annotation<string>(),
   user_profile_context: Annotation<string>(),
   image_path: Annotation<string>(),
+  model_source: Annotation<ChatModelSource>(),
+  runtime_stream_id: Annotation<string>(),
 });
 
 const callModel = async (state: typeof AgentState.State) => {
@@ -240,11 +348,21 @@ const callModel = async (state: typeof AgentState.State) => {
     recentMessages = state.messages.slice(-MAX_HISTORY_MESSAGES);
   }
 
-  const modelWithTools = needsImageToolCall
-    ? llm.bindTools(agentTools, { tool_choice: 'analyze_food_image' })
-    : llm.bindTools(agentTools);
+  const googleApiKey = pickGoogleApiKey();
+  const { value: response } = await invokeWithModelRouting({
+    modelSource: state.model_source || 'auto',
+    googleApiKey,
+    onStatus: (message) => emitRuntimeStatus(state.runtime_stream_id, message),
+    invokeProvider: async (provider) => {
+      const baseModel =
+        provider === 'google' && googleApiKey ? createGoogleChatModel(googleApiKey) : llm;
+      const modelWithTools = needsImageToolCall
+        ? baseModel.bindTools(agentTools, { tool_choice: 'analyze_food_image' })
+        : baseModel.bindTools(agentTools);
 
-  const response = await modelWithTools.invoke([systemMessage, ...recentMessages]);
+      return modelWithTools.invoke([systemMessage, ...recentMessages]);
+    },
+  });
   return { messages: [response] };
 };
 
@@ -274,107 +392,123 @@ export const runAgentStream = async (
     room_id: string;
     user_profile_context: string;
     image_path: string;
+    model_source: ChatModelSource;
   }
 ): Promise<{
   finalText: string;
   toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }>;
   approvalProposals: ProfileUpdateFields[];
 }> => {
-  const stream = agentApp.streamEvents(input, { ...config, version: 'v2' });
+  const runtimeStreamId = `${config.configurable.thread_id}:${Date.now().toString(36)}:${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
   const textByMessageId = new Map<string, string>();
   const toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }> = [];
   const approvalProposals: ProfileUpdateFields[] = [];
   let latestMessageId: string | null = null;
   let fallbackText = '';
 
-  for await (const event of stream) {
-    if (event.event === 'on_chat_model_stream') {
-      const content = getChunkText(event.data.chunk?.content);
-      if (!content) continue;
+  return withRuntimeStatusEmitter({
+    runtimeStreamId,
+    res,
+    work: async () => {
+      const stream = agentApp.streamEvents(
+        {
+          ...input,
+          runtime_stream_id: runtimeStreamId,
+        },
+        { ...config, version: 'v2' }
+      );
 
-      const chunkId = event.data.chunk?.id;
-      if (typeof chunkId === 'string' && chunkId.length > 0) {
-        const prev = textByMessageId.get(chunkId) || '';
-        const next = content.startsWith(prev) ? content : `${prev}${content}`;
-        textByMessageId.set(chunkId, next);
-        latestMessageId = chunkId;
-      } else {
-        const next = content.startsWith(fallbackText) ? content : `${fallbackText}${content}`;
-        fallbackText = next;
-      }
-    } else if (event.event === 'on_tool_start') {
-      const toolName = event.name || 'unknown_tool';
-      toolTraces.push({ name: toolName, status: 'running' });
-      sendSSE(res, { type: 'status', content: `Tool ${toolName}: running` });
-    } else if (event.event === 'on_tool_end') {
-      const toolName = event.name || 'unknown_tool';
-      const toolOutput = (event.data as { output?: unknown } | undefined)?.output;
-      const resultPreview = toStatusText(toolOutput);
-      const traceIndex = [...toolTraces]
-        .reverse()
-        .findIndex((trace) => trace.name === toolName && trace.status === 'running');
+    for await (const event of stream) {
+      if (event.event === 'on_chat_model_stream') {
+        const content = getChunkText(event.data.chunk?.content);
+        if (!content) continue;
 
-      if (traceIndex >= 0) {
-        const actualIndex = toolTraces.length - 1 - traceIndex;
-        toolTraces[actualIndex] = { name: toolName, status: 'success', result: resultPreview };
-      } else {
-        toolTraces.push({ name: toolName, status: 'success', result: resultPreview });
-      }
-
-      sendSSE(res, { type: 'status', content: `Tool ${toolName}: success` });
-      if (resultPreview) {
-        sendSSE(res, { type: 'status', content: `Tool ${toolName} result: ${resultPreview}` });
-      }
-      if (toolName === 'propose_profile_update') {
-        const proposal = parseProfileUpdateProposalOutput(toolOutput);
-        if (proposal) {
-          approvalProposals.push(proposal);
-          sendSSE(res, { type: 'status', content: 'Profile update proposal detected.' });
+        const chunkId = event.data.chunk?.id;
+        if (typeof chunkId === 'string' && chunkId.length > 0) {
+          const prev = textByMessageId.get(chunkId) || '';
+          const next = content.startsWith(prev) ? content : `${prev}${content}`;
+          textByMessageId.set(chunkId, next);
+          latestMessageId = chunkId;
         } else {
-          console.warn(
-            `Failed to parse propose_profile_update output: ${toStatusText(toolOutput, 600)}`
-          );
+          const next = content.startsWith(fallbackText) ? content : `${fallbackText}${content}`;
+          fallbackText = next;
+        }
+      } else if (event.event === 'on_tool_start') {
+        const toolName = event.name || 'unknown_tool';
+        toolTraces.push({ name: toolName, status: 'running' });
+        sendSSE(res, { type: 'status', content: `Tool ${toolName}: running` });
+      } else if (event.event === 'on_tool_end') {
+        const toolName = event.name || 'unknown_tool';
+        const toolOutput = (event.data as { output?: unknown } | undefined)?.output;
+        const resultPreview = toStatusText(toolOutput);
+        const traceIndex = [...toolTraces]
+          .reverse()
+          .findIndex((trace) => trace.name === toolName && trace.status === 'running');
+
+        if (traceIndex >= 0) {
+          const actualIndex = toolTraces.length - 1 - traceIndex;
+          toolTraces[actualIndex] = { name: toolName, status: 'success', result: resultPreview };
+        } else {
+          toolTraces.push({ name: toolName, status: 'success', result: resultPreview });
+        }
+
+        sendSSE(res, { type: 'status', content: `Tool ${toolName}: success` });
+        if (resultPreview) {
+          sendSSE(res, { type: 'status', content: `Tool ${toolName} result: ${resultPreview}` });
+        }
+        if (toolName === 'propose_profile_update') {
+          const proposal = parseProfileUpdateProposalOutput(toolOutput);
+          if (proposal) {
+            approvalProposals.push(proposal);
+            sendSSE(res, { type: 'status', content: 'Profile update proposal detected.' });
+          } else {
+            console.warn(
+              `Failed to parse propose_profile_update output: ${toStatusText(toolOutput, 600)}`
+            );
+          }
+        }
+      } else if (event.event === 'on_tool_error') {
+        const toolName = event.name || 'unknown_tool';
+        const errorPreview = toStatusText((event.data as { error?: unknown } | undefined)?.error);
+        const traceIndex = [...toolTraces]
+          .reverse()
+          .findIndex((trace) => trace.name === toolName && trace.status === 'running');
+
+        if (traceIndex >= 0) {
+          const actualIndex = toolTraces.length - 1 - traceIndex;
+          toolTraces[actualIndex] = { name: toolName, status: 'error', result: errorPreview };
+        } else {
+          toolTraces.push({ name: toolName, status: 'error', result: errorPreview });
+        }
+
+        sendSSE(res, { type: 'status', content: `Tool ${toolName}: error` });
+        if (errorPreview) {
+          sendSSE(res, { type: 'status', content: `Tool ${toolName} error: ${errorPreview}` });
         }
       }
-    } else if (event.event === 'on_tool_error') {
-      const toolName = event.name || 'unknown_tool';
-      const errorPreview = toStatusText((event.data as { error?: unknown } | undefined)?.error);
-      const traceIndex = [...toolTraces]
-        .reverse()
-        .findIndex((trace) => trace.name === toolName && trace.status === 'running');
-
-      if (traceIndex >= 0) {
-        const actualIndex = toolTraces.length - 1 - traceIndex;
-        toolTraces[actualIndex] = { name: toolName, status: 'error', result: errorPreview };
-      } else {
-        toolTraces.push({ name: toolName, status: 'error', result: errorPreview });
-      }
-
-      sendSSE(res, { type: 'status', content: `Tool ${toolName}: error` });
-      if (errorPreview) {
-        sendSSE(res, { type: 'status', content: `Tool ${toolName} error: ${errorPreview}` });
-      }
     }
-  }
 
-  const streamedText = latestMessageId
-    ? textByMessageId.get(latestMessageId) || ''
-    : fallbackText;
+    const streamedText = latestMessageId
+      ? textByMessageId.get(latestMessageId) || ''
+      : fallbackText;
 
-  if (streamedText.trim().length > 0) {
-    return { finalText: streamedText, toolTraces, approvalProposals };
-  }
-
-  try {
-    const snapshot = await agentApp.getState(config);
-    const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
-    const recoveredText = getLatestAiTextFromState(stateMessages);
-    if (recoveredText.length > 0) {
-      return { finalText: recoveredText, toolTraces, approvalProposals };
+    if (streamedText.trim().length > 0) {
+      return { finalText: streamedText, toolTraces, approvalProposals };
     }
-  } catch (stateError) {
-    console.error('Failed to recover final assistant text from state:', stateError);
-  }
 
-  return { finalText: '', toolTraces, approvalProposals };
+    try {
+      const snapshot = await agentApp.getState(config);
+      const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
+      const recoveredText = getLatestAiTextFromState(stateMessages);
+      if (recoveredText.length > 0) {
+        return { finalText: recoveredText, toolTraces, approvalProposals };
+      }
+    } catch (stateError) {
+      console.error('Failed to recover final assistant text from state:', stateError);
+    }
+    return { finalText: '', toolTraces, approvalProposals };
+    },
+  });
 };

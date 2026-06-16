@@ -31,3 +31,27 @@
         ├── SKILL.md                  # 如何總結長篇論文的指示
         └── file_tools.ts             # 寫入 NUTRITION_RULES.md 的工具
 ```
+## `/api/chat` model_source
+
+`POST /api/chat` 支援 `model_source` 欄位，可用來切換聊天模型來源：
+
+- `auto`：預設值。先嘗試 Google，若沒有 Google key 或 Google 上游失敗，會回退到 local。
+- `google`：優先走 Google，若 Google 額度耗盡或暫時失敗，會回退到 local。
+- `local`：只使用本地模型，不嘗試 Google。
+
+Request body 範例：
+
+```json
+{
+  "message": "請幫我分析這份餐點",
+  "thread_id": "thread-1",
+  "chat_history_id": "history-1",
+  "user_id": "user-123",
+  "model_source": "auto"
+}
+```
+## `/api/chat` model_source clarifications
+
+- `google` 代表偏好 Google，不代表一定會先打到 Google；如果沒有 `GEMINI_AI_API` / `GEMINI_API_KEY`，會直接走 local。
+- `google` 與 `auto` 在 Google 額度耗盡或上游暫時失敗時，都會回退到 local。
+- 前端不要把使用者選了 `google` 解讀成「一定先打 Google 上游」。

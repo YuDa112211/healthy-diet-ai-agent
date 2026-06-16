@@ -1,7 +1,8 @@
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getUserProfileTool, updateUserProfileTool } from '../agent_skills/db_tools';
-import { llm, runAgentStream } from './server/agentRuntime';
+import { createLocalOnlyStructuredOutputBinder, runAgentStream } from './server/agentRuntime';
+import { ChatRequestSchema, type ChatRequestPayload } from './server/chatPayload';
 import {
   AGENT_STREAM_TIMEOUT_MS,
   PROFILE_LOOKUP_TIMEOUT_MS,
@@ -45,39 +46,6 @@ export {
   urlencodedBodyParser,
 };
 
-const ChatRequestSchema = z
-  .object({
-    message: z.string().optional().default(''),
-    thread_id: z.string().trim().min(1),
-    chat_history_id: z.string().trim().min(1),
-    user_id: z.string().trim().optional(),
-    user_context: z
-      .union([
-        z.array(z.unknown()),
-        z.record(z.string(), z.unknown()),
-        z.null(),
-      ])
-      .optional()
-      .default([]),
-    image: z.unknown().optional(),
-    image_mime_type: z.string().trim().optional(),
-    imageMimeType: z.string().trim().optional(),
-    is_new_conversation: z.boolean().optional().default(false),
-  })
-  .superRefine((value, ctx) => {
-    const hasMessage = value.message.trim().length > 0;
-    const hasImage = value.image != null;
-    if (!hasMessage && !hasImage) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'Either message or image is required.',
-        path: ['message'],
-      });
-    }
-  });
-
-type ChatRequestPayload = z.infer<typeof ChatRequestSchema>;
-
 const ConversationSummarySchema = z.object({
   summary: z.array(z.string()).default([]),
 });
@@ -88,8 +56,9 @@ const ConversationTitleSchema = z.object({
   title: z.string().default(''),
 });
 
-const summaryExtractor = llm.withStructuredOutput(ConversationSummarySchema);
-const titleExtractor = llm.withStructuredOutput(ConversationTitleSchema);
+const localStructuredOutput = createLocalOnlyStructuredOutputBinder();
+const summaryExtractor = localStructuredOutput.withStructuredOutput(ConversationSummarySchema);
+const titleExtractor = localStructuredOutput.withStructuredOutput(ConversationTitleSchema);
 
 type UserProfileCacheEntry = {
   context: string;
@@ -502,6 +471,7 @@ export const chatHandler = async (req: Request, res: Response) => {
         room_id: payload.thread_id,
         user_profile_context: combinedContext,
         image_path: savedImagePath,
+        model_source: payload.model_source,
       }),
       AGENT_STREAM_TIMEOUT_MS,
       'agent stream'
