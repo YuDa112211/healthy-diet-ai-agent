@@ -79,7 +79,7 @@ Core variables:
 - `SUPABASE_SERVICE_KEY`: Supabase service role key
 - `GEMINI_AI_API`: Google API key used first for Google routing
 - `GEMINI_API_KEY`: fallback Google API key
-- `GOOGLE_CHAT_MODEL`: Google-routed chat model name
+- `GOOGLE_CHAT_MODEL`: Google-routed chat model name, default `gemma-4-31b-it`
 - `GOOGLE_BASE_URL`: Google OpenAI-compatible base URL
 - `MOHW_NEWS_SYNC_ENABLED`: enable periodic MOHW sync
 - `MOHW_NEWS_SYNC_INTERVAL_MINUTES`: auto-sync interval
@@ -138,6 +138,11 @@ Chat behavior notes:
 - if an image is included without text, the backend creates a fallback prompt
 - if multiple URLs are present, only the first URL is verified in that turn
 - profile updates are proposed first, then written only after `POST /api/approve`
+
+Current default chat model routing:
+
+- local chat model: `gemma`
+- Google chat model: `gemma-4-31b-it`
 
 ### 2. Knowledge search APIs
 

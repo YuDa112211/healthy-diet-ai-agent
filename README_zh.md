@@ -79,7 +79,7 @@ bun install
 - `SUPABASE_SERVICE_KEY`：Supabase service role key
 - `GEMINI_AI_API`：Google 路由優先使用的 API key
 - `GEMINI_API_KEY`：Google 路由備援 key
-- `GOOGLE_CHAT_MODEL`：Google 路由使用的模型名稱
+- `GOOGLE_CHAT_MODEL`：Google 路由使用的模型名稱，預設為 `gemma-4-31b-it`
 - `GOOGLE_BASE_URL`：Google OpenAI 相容 base URL
 - `MOHW_NEWS_SYNC_ENABLED`：是否開啟 MOHW 自動同步
 - `MOHW_NEWS_SYNC_INTERVAL_MINUTES`：同步週期
@@ -138,6 +138,11 @@ bun run start
 - 若只有圖片沒有文字，後端會自動補預設提示
 - 若訊息中有多個 URL，只會驗證第一個
 - 若偵測到明確個資更新，會先提出 proposal，再透過 `POST /api/approve` 寫入
+
+目前預設聊天模型路由：
+
+- local chat model：`gemma`
+- Google chat model：`gemma-4-31b-it`
 
 ### 2. 知識搜尋 API
 

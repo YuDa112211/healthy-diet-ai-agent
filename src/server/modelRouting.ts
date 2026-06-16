@@ -7,7 +7,7 @@ export type ChatProvider = 'google' | 'local';
 
 export const GOOGLE_BASE_URL =
   process.env.GOOGLE_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/';
-export const GOOGLE_CHAT_MODEL = process.env.GOOGLE_CHAT_MODEL || 'gemma-3-31b-it';
+export const GOOGLE_CHAT_MODEL = process.env.GOOGLE_CHAT_MODEL || 'gemma-4-31b-it';
 export const LOCAL_CHAT_MODEL = 'gemma';
 
 export const pickGoogleApiKey = (): string | undefined => {
