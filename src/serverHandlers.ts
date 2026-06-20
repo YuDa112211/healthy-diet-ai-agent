@@ -477,6 +477,7 @@ export const chatHandler = async (req: Request, res: Response) => {
       'agent stream'
     );
     const finalVisibleText = streamResult.finalText;
+    const streamedTextDelivered = streamResult.streamedTextDelivered;
     const toolTraces = streamResult.toolTraces;
     const approvalProposals = streamResult.approvalProposals;
     let approvalPending = false;
@@ -540,7 +541,7 @@ export const chatHandler = async (req: Request, res: Response) => {
       clearPendingApprovalByThread(payload.thread_id);
     }
 
-    if (!approvalPending && finalVisibleText.trim().length > 0) {
+    if (!approvalPending && finalVisibleText.trim().length > 0 && !streamedTextDelivered) {
       sendSSE(res, { type: 'text', content: finalVisibleText });
     }
 

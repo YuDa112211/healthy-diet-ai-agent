@@ -51,14 +51,11 @@ describe('buildAgentModelAttemptPlan', () => {
     ]);
     expect(buildAgentModelAttemptPlan('google', true)).toEqual([
       { provider: 'google', reason: 'selected' },
-      { provider: 'local', reason: 'fallback' },
     ]);
     expect(buildAgentModelAttemptPlan('auto', false)).toEqual([
       { provider: 'local', reason: 'selected' },
     ]);
-    expect(buildAgentModelAttemptPlan('google', false)).toEqual([
-      { provider: 'local', reason: 'selected' },
-    ]);
+    expect(buildAgentModelAttemptPlan('google', false)).toEqual([]);
   });
 });
 
@@ -94,7 +91,7 @@ describe('createLocalOnlyStructuredOutputBinder', () => {
 });
 
 describe('invokeWithModelRouting', () => {
-  test('goes directly to local when google key is unavailable', async () => {
+  test('goes directly to local in auto mode when google key is unavailable', async () => {
     const agentRuntime = agentRuntimeModule;
     const invokeWithModelRouting = getRequiredFunction<
       (input: {
@@ -109,7 +106,7 @@ describe('invokeWithModelRouting', () => {
     const statuses: string[] = [];
 
     const result = await invokeWithModelRouting({
-      modelSource: 'google',
+      modelSource: 'auto',
       onStatus: (message) => statuses.push(message),
       invokeProvider: async (provider) => {
         calls.push(provider);
@@ -119,7 +116,37 @@ describe('invokeWithModelRouting', () => {
 
     expect(result).toEqual({ provider: 'local', value: 'reply:local' });
     expect(calls).toEqual(['local']);
-    expect(statuses).toEqual(['Model selected: local']);
+    expect(statuses).toEqual([
+      'Model selected: local',
+      'Provider local: requesting model response',
+      'Provider local: response received',
+    ]);
+  });
+
+  test('rejects google mode immediately when google key is unavailable', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const invokeWithModelRouting = getRequiredFunction<
+      (input: {
+        modelSource: 'auto' | 'google' | 'local';
+        googleApiKey?: string;
+        onStatus?: (message: string) => void;
+        invokeProvider: (provider: ChatProvider) => Promise<string>;
+      }) => Promise<{ provider: ChatProvider; value: string }>
+    >((agentRuntime as Record<string, unknown>).invokeWithModelRouting, 'invokeWithModelRouting');
+
+    const calls: ChatProvider[] = [];
+
+    await expect(
+      invokeWithModelRouting({
+        modelSource: 'google',
+        invokeProvider: async (provider) => {
+          calls.push(provider);
+          return `reply:${provider}`;
+        },
+      })
+    ).rejects.toThrow('Google model requested but GEMINI_AI_API/GEMINI_API_KEY is not configured.');
+
+    expect(calls).toEqual([]);
   });
 
   test('falls back to local after a retryable google upstream failure', async () => {
@@ -153,7 +180,10 @@ describe('invokeWithModelRouting', () => {
     expect(calls).toEqual(['google', 'local']);
     expect(statuses).toEqual([
       'Model selected: google',
+      'Provider google: requesting model response',
       'Google upstream failed, falling back to local model.',
+      'Provider local: requesting model response',
+      'Provider local: response received',
     ]);
   });
 
@@ -184,7 +214,10 @@ describe('invokeWithModelRouting', () => {
     ).rejects.toThrow('400 invalid api key');
 
     expect(calls).toEqual(['google']);
-    expect(statuses).toEqual(['Model selected: google']);
+    expect(statuses).toEqual([
+      'Model selected: google',
+      'Provider google: requesting model response',
+    ]);
   });
 });
 
@@ -281,5 +314,33 @@ describe('visible text sanitization', () => {
     ].join('\n\n'));
 
     expect(sanitized).toBe(['我目前可以幫你做這些事：', '1. 分析食物照片'].join('\n\n'));
+  });
+});
+
+describe('stream chunk accumulation', () => {
+  test('extracts only the new delta text from cumulative chunks', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const appendStreamChunk = getRequiredFunction<
+      (
+        existing: string,
+        incoming: string
+      ) => { nextText: string; deltaText: string }
+    >(
+      (agentRuntime as Record<string, unknown>).appendStreamChunk,
+      'appendStreamChunk'
+    );
+
+    expect(appendStreamChunk('', 'Hello')).toEqual({
+      nextText: 'Hello',
+      deltaText: 'Hello',
+    });
+    expect(appendStreamChunk('Hello', 'Hello world')).toEqual({
+      nextText: 'Hello world',
+      deltaText: ' world',
+    });
+    expect(appendStreamChunk('Hello world', '!')).toEqual({
+      nextText: 'Hello world!',
+      deltaText: '!',
+    });
   });
 });

@@ -53,14 +53,20 @@ describe('buildPreferredProviderOrder', () => {
     expect(buildPreferredProviderOrder('local', false)).toEqual(['local']);
   });
 
-  test('prefers google then local when auto or google has a key', () => {
+  test('prefers google then local when auto has a key', () => {
     expect(buildPreferredProviderOrder('auto', true)).toEqual(['google', 'local']);
-    expect(buildPreferredProviderOrder('google', true)).toEqual(['google', 'local']);
   });
 
-  test('falls back to local when auto or google has no key', () => {
+  test('uses google-only when google model source has a key', () => {
+    expect(buildPreferredProviderOrder('google', true)).toEqual(['google']);
+  });
+
+  test('falls back to local when auto has no key', () => {
     expect(buildPreferredProviderOrder('auto', false)).toEqual(['local']);
-    expect(buildPreferredProviderOrder('google', false)).toEqual(['local']);
+  });
+
+  test('returns no providers when google model source has no key', () => {
+    expect(buildPreferredProviderOrder('google', false)).toEqual([]);
   });
 });
 

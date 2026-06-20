@@ -33,6 +33,31 @@ const sendSSE = (res: Response, data: object) => {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 };
 
+export const appendStreamChunk = (
+  existing: string,
+  incoming: string
+): { nextText: string; deltaText: string } => {
+  if (!incoming) {
+    return { nextText: existing, deltaText: '' };
+  }
+
+  if (!existing) {
+    return { nextText: incoming, deltaText: incoming };
+  }
+
+  if (incoming.startsWith(existing)) {
+    return {
+      nextText: incoming,
+      deltaText: incoming.slice(existing.length),
+    };
+  }
+
+  return {
+    nextText: `${existing}${incoming}`,
+    deltaText: incoming,
+  };
+};
+
 const runtimeStatusEmitters = new Map<string, (message: string) => void>();
 
 const emitRuntimeStatus = (runtimeStreamId: string | undefined, message: string) => {
@@ -113,6 +138,15 @@ export const sanitizeAssistantVisibleText = (message: string): string => {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 };
+
+const RESPONSE_FORMAT_INSTRUCTIONS = [
+  'Match this response format exactly:',
+  '- Use short paragraphs in Traditional Chinese.',
+  '- When listing concrete advice, use numbered lists.',
+  '- Keep headings minimal; only add one short heading when it helps.',
+  '- Do not output markdown tables or raw JSON.',
+  '- End cleanly without meta commentary about formatting or model choice.',
+].join('\n');
 
 const hasAnalyzeFoodToolResult = (messages: unknown[] | undefined): boolean => {
   if (!Array.isArray(messages)) return false;
@@ -370,6 +404,9 @@ export const invokeWithModelRouting = async <T>({
   const selectedProvider = attempts[0]?.provider;
 
   if (!selectedProvider) {
+    if (modelSource === 'google') {
+      throw new Error('Google model requested but GEMINI_AI_API/GEMINI_API_KEY is not configured.');
+    }
     throw new Error('No chat model provider available.');
   }
 
@@ -381,7 +418,9 @@ export const invokeWithModelRouting = async <T>({
     if (!currentAttempt) continue;
 
     try {
+      onStatus?.(`Provider ${currentAttempt.provider}: requesting model response`);
       const value = await invokeProvider(currentAttempt.provider);
+      onStatus?.(`Provider ${currentAttempt.provider}: response received`);
       return { provider: currentAttempt.provider, value };
     } catch (error) {
       const shouldFallback =
@@ -457,6 +496,7 @@ const callModel = async (state: typeof AgentState.State) => {
       : 'No image attached in this request.',
     '',
     '--- Response Style ---',
+    RESPONSE_FORMAT_INSTRUCTIONS,
     'Never output raw JSON directly to the user.',
     'If tool outputs JSON, convert it into concise Traditional Chinese explanation.',
     'If the user asks what you can do, what features you have, or what capabilities are available, call list_capabilities_tool first and answer strictly from that result.',
@@ -510,6 +550,7 @@ const callModel = async (state: typeof AgentState.State) => {
         ? baseModel.bindTools(agentTools, { tool_choice: toolChoice })
         : baseModel.bindTools(agentTools);
 
+      emitRuntimeStatus(state.runtime_stream_id, `Provider ${provider}: stream opened`);
       return modelWithTools.invoke([systemMessage, ...recentMessages]);
     },
   });
@@ -546,6 +587,7 @@ export const runAgentStream = async (
   }
 ): Promise<{
   finalText: string;
+  streamedTextDelivered: boolean;
   toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }>;
   approvalProposals: ProfileUpdateFields[];
 }> => {
@@ -557,6 +599,7 @@ export const runAgentStream = async (
   const approvalProposals: ProfileUpdateFields[] = [];
   let latestMessageId: string | null = null;
   let fallbackText = '';
+  let streamedTextDelivered = false;
 
   return withRuntimeStatusEmitter({
     runtimeStreamId,
@@ -575,15 +618,23 @@ export const runAgentStream = async (
         const content = getChunkText(event.data.chunk?.content);
         if (!content) continue;
 
+        let deltaText = '';
         const chunkId = event.data.chunk?.id;
         if (typeof chunkId === 'string' && chunkId.length > 0) {
           const prev = textByMessageId.get(chunkId) || '';
-          const next = content.startsWith(prev) ? content : `${prev}${content}`;
-          textByMessageId.set(chunkId, next);
+          const updated = appendStreamChunk(prev, content);
+          textByMessageId.set(chunkId, updated.nextText);
+          deltaText = updated.deltaText;
           latestMessageId = chunkId;
         } else {
-          const next = content.startsWith(fallbackText) ? content : `${fallbackText}${content}`;
-          fallbackText = next;
+          const updated = appendStreamChunk(fallbackText, content);
+          fallbackText = updated.nextText;
+          deltaText = updated.deltaText;
+        }
+
+        if (deltaText) {
+          streamedTextDelivered = true;
+          sendSSE(res, { type: 'text', content: deltaText });
         }
       } else if (event.event === 'on_tool_start') {
         const toolName = event.name || 'unknown_tool';
@@ -646,7 +697,7 @@ export const runAgentStream = async (
     const sanitizedStreamedText = sanitizeAssistantVisibleText(streamedText);
 
     if (sanitizedStreamedText.length > 0) {
-      return { finalText: sanitizedStreamedText, toolTraces, approvalProposals };
+      return { finalText: sanitizedStreamedText, streamedTextDelivered, toolTraces, approvalProposals };
     }
 
     try {
@@ -654,12 +705,12 @@ export const runAgentStream = async (
       const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
       const recoveredText = sanitizeAssistantVisibleText(getLatestAiTextFromState(stateMessages));
       if (recoveredText.length > 0) {
-        return { finalText: recoveredText, toolTraces, approvalProposals };
+        return { finalText: recoveredText, streamedTextDelivered, toolTraces, approvalProposals };
       }
     } catch (stateError) {
       console.error('Failed to recover final assistant text from state:', stateError);
     }
-    return { finalText: '', toolTraces, approvalProposals };
+    return { finalText: '', streamedTextDelivered, toolTraces, approvalProposals };
     },
   });
 };

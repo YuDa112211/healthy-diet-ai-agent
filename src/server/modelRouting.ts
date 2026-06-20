@@ -22,6 +22,10 @@ export const buildPreferredProviderOrder = (
     return ['local'];
   }
 
+  if (modelSource === 'google') {
+    return hasGoogleKey ? ['google'] : [];
+  }
+
   if (hasGoogleKey) {
     return ['google', 'local'];
   }
