@@ -5,6 +5,7 @@ import { tool } from '@langchain/core/tools';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
 import { z } from 'zod';
+import { getAiApiUrl } from '../src/server/aiRuntime';
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../');
 
@@ -70,7 +71,7 @@ export const visionAnalyzerTool = tool(
         temperature: 0,
         maxTokens: 2048,
         apiKey: process.env.AI_API_KEY || 'dummy',
-        configuration: { baseURL: process.env.AI_API_URL || 'http://localhost:8080/v1' },
+        configuration: { baseURL: getAiApiUrl() },
       });
 
       const systemPrompt = [

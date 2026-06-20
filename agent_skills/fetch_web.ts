@@ -4,6 +4,7 @@ import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { z } from 'zod';
 import { load } from 'cheerio';
 import net from 'net';
+import { getAiApiUrl } from '../src/server/aiRuntime';
 
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_VERIFY_TIMEOUT_MS = 6000;
@@ -98,7 +99,7 @@ const buildSummarizer = (summaryMaxTokens: number): ChatOpenAI =>
     temperature: 0.1,
     maxTokens: summaryMaxTokens,
     apiKey: process.env.AI_API_KEY || 'dummy',
-    configuration: { baseURL: process.env.AI_API_URL || 'http://localhost:8080/v1' }
+    configuration: { baseURL: getAiApiUrl() }
   });
 
 const summarizeChunk = async (

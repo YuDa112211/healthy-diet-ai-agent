@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
+import { getAiApiUrl } from './aiRuntime';
 
-export const AI_API_URL = process.env.AI_API_URL || 'http://100.113.105.18:8080/v1';
+export const AI_API_URL = getAiApiUrl();
 
 const supabaseUrl = process.env.SUPABASE_URL || '';
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY || '';
