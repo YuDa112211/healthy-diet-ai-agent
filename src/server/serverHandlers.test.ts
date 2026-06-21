@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   persistChatRoomMetaWithClientForTest,
   persistSummaryOutputsForTest,
+  shouldFallbackSummarizeTurn,
 } from '../serverHandlers';
 
 describe('persistChatRoomMetaWithClientForTest', () => {
@@ -105,5 +106,25 @@ describe('persistSummaryOutputsForTest', () => {
     });
 
     expect(writes).toEqual(['room']);
+  });
+});
+
+describe('shouldFallbackSummarizeTurn', () => {
+  test('returns true for non-empty exchanges so the model can decide', () => {
+    expect(
+      shouldFallbackSummarizeTurn({
+        userMessage: '可以分析我的身體狀況後給我一份今天的專屬食譜嗎',
+        assistantReply: '這是一段有內容的回答。',
+      })
+    ).toBe(true);
+  });
+
+  test('returns false for empty exchanges', () => {
+    expect(
+      shouldFallbackSummarizeTurn({
+        userMessage: '   ',
+        assistantReply: '',
+      })
+    ).toBe(false);
   });
 });

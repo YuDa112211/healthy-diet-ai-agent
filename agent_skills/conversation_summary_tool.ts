@@ -107,64 +107,136 @@ export const buildSummaryPersistenceGuard = (input: {
 
 const localStructuredSummaryModel = createLocalChatModel();
 
-export const summarizeConversationTurnTool = tool(
-  async ({
-    room_id,
-    user_id,
-    existing_room_summary,
+export const generateConversationSummaryForTurn = async ({
+  room_id,
+  user_id,
+  existing_room_summary,
+  current_user_message,
+  current_assistant_reply,
+}: {
+  room_id: string;
+  user_id?: string;
+  existing_room_summary?: string;
+  current_user_message: string;
+  current_assistant_reply: string;
+}): Promise<ConversationSummaryToolResult> => {
+  const guard = buildSummaryPersistenceGuard({
     current_user_message,
     current_assistant_reply,
-  }) => {
-    const guard = buildSummaryPersistenceGuard({
-      current_user_message,
-      current_assistant_reply,
-    });
+  });
 
-    if (!guard.shouldPersist) {
-      return JSON.stringify({
-        should_persist: false,
-        compact_summary: '',
-        detailed_summary: '',
-        reason: guard.reason,
-      } satisfies ConversationSummaryToolResult);
-    }
-
-    const structured = await localStructuredSummaryModel
-      .withStructuredOutput(
-        z.object({
-          compact_summary: z.string(),
-          detailed_summary: z.string(),
-        })
-      )
-      .invoke([
-        {
-          role: 'system',
-          content: [
-            'You summarize meaningful conversation turns in Traditional Chinese.',
-            'Use the existing room summary plus the latest user and assistant exchange.',
-            'Return compact_summary as a concise room-memory summary.',
-            'Return detailed_summary as a fuller archival summary for future retrieval.',
-            'Do not include markdown tables or JSON outside the schema.',
-          ].join('\n'),
-        },
-        {
-          role: 'user',
-          content: [
-            `room_id: ${room_id}`,
-            user_id ? `user_id: ${user_id}` : 'user_id: unknown',
-            `existing_room_summary: ${existing_room_summary?.trim() || '(none)'}`,
-            `current_user_message: ${current_user_message}`,
-            `current_assistant_reply: ${current_assistant_reply}`,
-          ].join('\n\n'),
-        },
-      ]);
-
-    return JSON.stringify({
-      should_persist: true,
-      compact_summary: structured.compact_summary.trim(),
-      detailed_summary: structured.detailed_summary.trim(),
+  if (!guard.shouldPersist) {
+    return {
+      should_persist: false,
+      compact_summary: '',
+      detailed_summary: '',
       reason: guard.reason,
-    } satisfies ConversationSummaryToolResult);
+    };
+  }
+
+  const structured = await localStructuredSummaryModel
+    .withStructuredOutput(
+      z.object({
+        compact_summary: z.string(),
+        detailed_summary: z.string(),
+      })
+    )
+    .invoke([
+      {
+        role: 'system',
+        content: [
+          'You summarize meaningful conversation turns in Traditional Chinese.',
+          'Use the existing room summary plus the latest user and assistant exchange.',
+          'Return compact_summary as a concise room-memory summary.',
+          'Return detailed_summary as a fuller archival summary for future retrieval.',
+          'Do not include markdown tables or JSON outside the schema.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          `room_id: ${room_id}`,
+          user_id ? `user_id: ${user_id}` : 'user_id: unknown',
+          `existing_room_summary: ${existing_room_summary?.trim() || '(none)'}`,
+          `current_user_message: ${current_user_message}`,
+          `current_assistant_reply: ${current_assistant_reply}`,
+        ].join('\n\n'),
+      },
+    ]);
+
+  return {
+    should_persist: true,
+    compact_summary: structured.compact_summary.trim(),
+    detailed_summary: structured.detailed_summary.trim(),
+    reason: guard.reason,
+  };
+};
+
+export const decideConversationSummaryNeed = async ({
+  room_id,
+  user_id,
+  existing_room_summary,
+  current_user_message,
+  current_assistant_reply,
+}: {
+  room_id: string;
+  user_id?: string;
+  existing_room_summary?: string;
+  current_user_message: string;
+  current_assistant_reply: string;
+}): Promise<{ should_persist: boolean; reason: string }> => {
+  const guard = buildSummaryPersistenceGuard({
+    current_user_message,
+    current_assistant_reply,
+  });
+
+  if (!guard.shouldPersist) {
+    return {
+      should_persist: false,
+      reason: guard.reason,
+    };
+  }
+
+  const decision = await localStructuredSummaryModel
+    .withStructuredOutput(
+      z.object({
+        should_persist: z.boolean(),
+        reason: z.string(),
+      })
+    )
+    .invoke([
+      {
+        role: 'system',
+        content: [
+          'You decide whether a completed conversation turn deserves long-term memory.',
+          'Use Traditional Chinese reasoning compressed into a short reason string.',
+          'Mark should_persist true only when the turn has durable future value such as meal plans, personalized health analysis, nutrition strategy, verified recommendations, or stable user preferences.',
+          'Mark should_persist false for greetings, retries, errors, tiny clarifications, or short low-value exchanges.',
+          'Return only the schema.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          `room_id: ${room_id}`,
+          user_id ? `user_id: ${user_id}` : 'user_id: unknown',
+          `existing_room_summary: ${existing_room_summary?.trim() || '(none)'}`,
+          `current_user_message: ${current_user_message}`,
+          `current_assistant_reply: ${current_assistant_reply}`,
+        ].join('\n\n'),
+      },
+    ]);
+
+  return {
+    should_persist: decision.should_persist,
+    reason: decision.reason.trim() || 'model-decision',
+  };
+};
+
+export const summarizeConversationTurnTool = tool(
+  async (input) => {
+    const result = await generateConversationSummaryForTurn(input);
+    return JSON.stringify(result satisfies ConversationSummaryToolResult);
   },
   {
     name: 'summarize_conversation_turn',

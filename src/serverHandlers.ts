@@ -1,6 +1,10 @@
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getUserProfileTool, logDietTool, updateUserProfileTool } from '../agent_skills/db_tools';
+import {
+  decideConversationSummaryNeed,
+  generateConversationSummaryForTurn,
+} from '../agent_skills/conversation_summary_tool';
 import { createLocalOnlyStructuredOutputBinder, runAgentStream } from './server/agentRuntime';
 import { ChatRequestSchema, type ChatRequestPayload } from './server/chatPayload';
 import {
@@ -214,7 +218,10 @@ const persistChatRoomMeta = async (input: {
 };
 
 const normalizeChatRoomSummary = (rawSummary: unknown): string => {
-  if (typeof rawSummary === 'string') return rawSummary.trim();
+  if (typeof rawSummary === 'string') {
+    const trimmed = rawSummary.trim();
+    return trimmed === '[]' ? '' : trimmed;
+  }
   if (Array.isArray(rawSummary)) {
     return rawSummary
       .map((item) => (typeof item === 'string' ? item.trim() : ''))
@@ -229,6 +236,15 @@ const normalizeChatRoomSummary = (rawSummary: unknown): string => {
     }
   }
   return '';
+};
+
+export const shouldFallbackSummarizeTurn = (input: {
+  userMessage: string;
+  assistantReply: string;
+}): boolean => {
+  const userText = input.userMessage.trim();
+  const assistantText = input.assistantReply.trim();
+  return userText.length > 0 && assistantText.length > 0;
 };
 
 const fetchExistingRoomSummary = async (threadId: string, userId?: string): Promise<string> => {
@@ -259,6 +275,9 @@ const persistSummaryOutputs = async ({
   userId,
   title,
   summaryProposals,
+  existingRoomSummary = '',
+  userMessageForFallback = '',
+  assistantReplyForFallback = '',
   persistChatRoomMetaFn = persistChatRoomMeta,
   insertSummaryHistoryRowFn = async (input: {
     threadId: string;
@@ -278,6 +297,9 @@ const persistSummaryOutputs = async ({
   userId?: string;
   title?: string;
   summaryProposals: ConversationSummaryToolResult[];
+  existingRoomSummary?: string;
+  userMessageForFallback?: string;
+  assistantReplyForFallback?: string;
   persistChatRoomMetaFn?: typeof persistChatRoomMeta;
   insertSummaryHistoryRowFn?: (input: {
     threadId: string;
@@ -285,8 +307,32 @@ const persistSummaryOutputs = async ({
     detailedSummary: string;
   }) => Promise<unknown>;
 }) => {
-  const latestSummaryProposal =
+  let latestSummaryProposal =
     summaryProposals.length > 0 ? summaryProposals[summaryProposals.length - 1] : null;
+
+  if (!latestSummaryProposal && shouldFallbackSummarizeTurn({
+    userMessage: userMessageForFallback,
+    assistantReply: assistantReplyForFallback,
+  })) {
+    const decision = await decideConversationSummaryNeed({
+      room_id: threadId,
+      user_id: userId,
+      existing_room_summary: existingRoomSummary,
+      current_user_message: userMessageForFallback,
+      current_assistant_reply: assistantReplyForFallback,
+    });
+
+    if (decision.should_persist) {
+      latestSummaryProposal = await generateConversationSummaryForTurn({
+        room_id: threadId,
+        user_id: userId,
+        existing_room_summary: existingRoomSummary,
+        current_user_message: userMessageForFallback,
+        current_assistant_reply: assistantReplyForFallback,
+      });
+      latestSummaryProposal.reason = decision.reason;
+    }
+  }
 
   if (latestSummaryProposal?.should_persist) {
     await persistChatRoomMetaFn({
@@ -620,6 +666,9 @@ export const chatHandler = async (req: Request, res: Response) => {
           userId: normalizedUserId,
           title,
           summaryProposals,
+          existingRoomSummary: await fetchExistingRoomSummary(payload.thread_id, normalizedUserId),
+          userMessageForFallback: effectiveUserMessage,
+          assistantReplyForFallback: finalVisibleText,
         });
         console.log(
           `[REQ ${requestId}] persistence success chat_history_id=${payload.chat_history_id} room_id=${payload.thread_id}`
