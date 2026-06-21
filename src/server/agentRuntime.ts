@@ -19,6 +19,7 @@ import { checkWebPageTool, fetchWebPageTool } from '../../agent_skills/fetch_web
 import { AGENT_FILE, INDEX_FILE, LEGACY_INDEX_FILE, RULES_FILE } from './workspacePaths';
 import { toStatusText } from './httpRuntime';
 import type { ChatModelSource } from './chatPayload';
+import { formatSSEMessage, sendSSE as writeSSE } from './sse';
 import {
   buildPreferredProviderOrder,
   createGoogleChatModel,
@@ -34,8 +35,14 @@ import {
   type ProfileUpdateFields,
 } from './profileApproval';
 
+export { formatSSEMessage };
+
 const sendSSE = (res: Response, data: object) => {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const eventName =
+    typeof (data as { type?: unknown }).type === 'string'
+      ? (data as { type: string }).type
+      : undefined;
+  writeSSE(res, data, eventName);
 };
 
 export const appendStreamChunk = (

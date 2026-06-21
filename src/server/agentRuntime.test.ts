@@ -334,6 +334,23 @@ describe('visible text sanitization', () => {
 });
 
 describe('stream chunk accumulation', () => {
+  test('formats SSE messages with explicit event names when provided', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const formatSSEMessage = getRequiredFunction<
+      (data: object, eventName?: string) => string
+    >(
+      (agentRuntime as Record<string, unknown>).formatSSEMessage,
+      'formatSSEMessage'
+    );
+
+    expect(formatSSEMessage({ type: 'text', content: 'hi' }, 'text')).toBe(
+      'event: text\ndata: {"type":"text","content":"hi"}\n\n'
+    );
+    expect(formatSSEMessage({ type: 'status', content: 'thinking' })).toBe(
+      'data: {"type":"status","content":"thinking"}\n\n'
+    );
+  });
+
   test('extracts only the new delta text from cumulative chunks', async () => {
     const agentRuntime = agentRuntimeModule;
     const appendStreamChunk = getRequiredFunction<

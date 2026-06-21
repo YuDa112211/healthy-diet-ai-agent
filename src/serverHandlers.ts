@@ -7,6 +7,7 @@ import {
 } from '../agent_skills/conversation_summary_tool';
 import { createLocalOnlyStructuredOutputBinder, runAgentStream } from './server/agentRuntime';
 import { ChatRequestSchema, type ChatRequestPayload } from './server/chatPayload';
+import { sendSSE as writeSSE } from './server/sse';
 import {
   AGENT_STREAM_TIMEOUT_MS,
   PROFILE_LOOKUP_TIMEOUT_MS,
@@ -432,7 +433,11 @@ const fetchUserProfileContext = async (userId?: string): Promise<string> => {
 };
 
 const sendSSE = (res: Response, data: object) => {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const eventName =
+    typeof (data as { type?: unknown }).type === 'string'
+      ? (data as { type: string }).type
+      : undefined;
+  writeSSE(res, data, eventName);
 };
 
 export const chatHandler = async (req: Request, res: Response) => {
