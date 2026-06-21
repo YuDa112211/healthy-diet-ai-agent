@@ -10,6 +10,11 @@ import { visionAnalyzerTool } from '../../agent_skills/vision_model';
 import { calculateNutritionTool } from '../../agent_skills/calc_tools';
 import { getChatHistoryTool } from '../../agent_skills/db_tools';
 import { compressChatHistoryTool } from '../../agent_skills/summarizer_tools';
+import {
+  parseConversationSummaryToolOutput,
+  summarizeConversationTurnTool,
+  type ConversationSummaryToolResult,
+} from '../../agent_skills/conversation_summary_tool';
 import { checkWebPageTool, fetchWebPageTool } from '../../agent_skills/fetch_web';
 import { AGENT_FILE, INDEX_FILE, LEGACY_INDEX_FILE, RULES_FILE } from './workspacePaths';
 import { toStatusText } from './httpRuntime';
@@ -137,6 +142,51 @@ export const sanitizeAssistantVisibleText = (message: string): string => {
   return withoutSelfClosingThoughts
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+};
+
+export const sanitizeAssistantStreamingText = (message: string): string => {
+  if (!message) return '';
+
+  const lowerMessage = message.toLowerCase();
+  const openTag = '<thought>';
+  const closeTag = '</thought>';
+  let output = '';
+  let index = 0;
+  let insideThought = false;
+
+  while (index < message.length) {
+    const remainingLower = lowerMessage.slice(index);
+
+    if (!insideThought) {
+      if (remainingLower.startsWith(openTag)) {
+        insideThought = true;
+        index += openTag.length;
+        continue;
+      }
+
+      if (openTag.startsWith(remainingLower)) {
+        break;
+      }
+
+      output += message[index] || '';
+      index += 1;
+      continue;
+    }
+
+    if (remainingLower.startsWith(closeTag)) {
+      insideThought = false;
+      index += closeTag.length;
+      continue;
+    }
+
+    if (closeTag.startsWith(remainingLower)) {
+      break;
+    }
+
+    index += 1;
+  }
+
+  return output;
 };
 
 const RESPONSE_FORMAT_INSTRUCTIONS = [
@@ -271,6 +321,7 @@ const REGISTERED_CAPABILITY_TOOL_NAMES = [
   'get_chat_history',
   'propose_profile_update',
   'compress_chat_history',
+  'summarize_conversation_turn',
   'list_capabilities_tool',
 ];
 
@@ -355,6 +406,7 @@ const agentTools = [
   getChatHistoryTool,
   proposeProfileUpdateTool,
   compressChatHistoryTool,
+  summarizeConversationTurnTool,
   listCapabilitiesTool,
 ];
 const toolNode = new ToolNode(agentTools);
@@ -388,6 +440,38 @@ export const createLocalOnlyStructuredOutputBinder = (
   withStructuredOutput: <TSchema extends z.ZodTypeAny>(schema: TSchema) =>
     model.withStructuredOutput(schema),
 });
+
+export const invokeStructuredOutputWithRouting = async <TSchema extends z.ZodTypeAny>({
+  modelSource,
+  googleApiKey,
+  schema,
+  prompt,
+  onStatus,
+  createStructuredInvoker,
+}: {
+  modelSource: ChatModelSource;
+  googleApiKey?: string;
+  schema: TSchema;
+  prompt: unknown;
+  onStatus?: (message: string) => void;
+  createStructuredInvoker?: (
+    provider: ChatProvider
+  ) => { invoke: (input: unknown) => Promise<z.infer<TSchema>> };
+}): Promise<{ provider: ChatProvider; value: z.infer<TSchema> }> => {
+  return invokeWithModelRouting({
+    modelSource,
+    googleApiKey,
+    onStatus,
+    invokeProvider: async (provider) => {
+      const invoker =
+        createStructuredInvoker?.(provider) ||
+        (((provider === 'google' && googleApiKey ? createGoogleChatModel(googleApiKey) : llm) as
+          unknown as StructuredOutputModel).withStructuredOutput(schema));
+
+      return invoker.invoke(prompt);
+    },
+  });
+};
 
 export const invokeWithModelRouting = async <T>({
   modelSource,
@@ -523,6 +607,8 @@ const callModel = async (state: typeof AgentState.State) => {
     'Do not update profile for guesses, hypotheticals, or unclear statements.',
     'If information is ambiguous, ask a short confirmation question.',
     'When no new profile info is provided, continue normal conversation.',
+    'Call summarize_conversation_turn only after you have already formed the final assistant answer and only when the completed turn has durable future value.',
+    'Do not call summarize_conversation_turn for greetings, retries, temporary failures, or low-information exchanges.',
   ].join('\n');
 
   const systemMessage = { role: 'system', content: prompt };
@@ -590,15 +676,19 @@ export const runAgentStream = async (
   streamedTextDelivered: boolean;
   toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }>;
   approvalProposals: ProfileUpdateFields[];
+  summaryProposals: ConversationSummaryToolResult[];
 }> => {
   const runtimeStreamId = `${config.configurable.thread_id}:${Date.now().toString(36)}:${Math.random()
     .toString(36)
     .slice(2, 8)}`;
   const textByMessageId = new Map<string, string>();
+  const visibleTextByMessageId = new Map<string, string>();
   const toolTraces: Array<{ name: string; status: 'running' | 'success' | 'error'; result?: string }> = [];
   const approvalProposals: ProfileUpdateFields[] = [];
+  const summaryProposals: ConversationSummaryToolResult[] = [];
   let latestMessageId: string | null = null;
-  let fallbackText = '';
+  let fallbackRawText = '';
+  let fallbackVisibleText = '';
   let streamedTextDelivered = false;
 
   return withRuntimeStatusEmitter({
@@ -624,12 +714,19 @@ export const runAgentStream = async (
           const prev = textByMessageId.get(chunkId) || '';
           const updated = appendStreamChunk(prev, content);
           textByMessageId.set(chunkId, updated.nextText);
-          deltaText = updated.deltaText;
+          const nextVisibleText = sanitizeAssistantStreamingText(updated.nextText);
+          const prevVisibleText = visibleTextByMessageId.get(chunkId) || '';
+          const visibleUpdate = appendStreamChunk(prevVisibleText, nextVisibleText);
+          visibleTextByMessageId.set(chunkId, nextVisibleText);
+          deltaText = visibleUpdate.deltaText;
           latestMessageId = chunkId;
         } else {
-          const updated = appendStreamChunk(fallbackText, content);
-          fallbackText = updated.nextText;
-          deltaText = updated.deltaText;
+          const updated = appendStreamChunk(fallbackRawText, content);
+          fallbackRawText = updated.nextText;
+          const nextVisibleText = sanitizeAssistantStreamingText(fallbackRawText);
+          const visibleUpdate = appendStreamChunk(fallbackVisibleText, nextVisibleText);
+          fallbackVisibleText = nextVisibleText;
+          deltaText = visibleUpdate.deltaText;
         }
 
         if (deltaText) {
@@ -669,6 +766,19 @@ export const runAgentStream = async (
               `Failed to parse propose_profile_update output: ${toStatusText(toolOutput, 600)}`
             );
           }
+        } else if (toolName === 'summarize_conversation_turn') {
+          const summaryProposal = parseConversationSummaryToolOutput(toolOutput);
+          if (summaryProposal) {
+            summaryProposals.push(summaryProposal);
+            sendSSE(res, {
+              type: 'status',
+              content: `Conversation summary proposal: ${summaryProposal.reason}`,
+            });
+          } else {
+            console.warn(
+              `Failed to parse summarize_conversation_turn output: ${toStatusText(toolOutput, 600)}`
+            );
+          }
         }
       } else if (event.event === 'on_tool_error') {
         const toolName = event.name || 'unknown_tool';
@@ -693,11 +803,17 @@ export const runAgentStream = async (
 
     const streamedText = latestMessageId
       ? textByMessageId.get(latestMessageId) || ''
-      : fallbackText;
+      : fallbackRawText;
     const sanitizedStreamedText = sanitizeAssistantVisibleText(streamedText);
 
     if (sanitizedStreamedText.length > 0) {
-      return { finalText: sanitizedStreamedText, streamedTextDelivered, toolTraces, approvalProposals };
+      return {
+        finalText: sanitizedStreamedText,
+        streamedTextDelivered,
+        toolTraces,
+        approvalProposals,
+        summaryProposals,
+      };
     }
 
     try {
@@ -705,12 +821,18 @@ export const runAgentStream = async (
       const stateMessages = (snapshot?.values as { messages?: unknown[] } | undefined)?.messages;
       const recoveredText = sanitizeAssistantVisibleText(getLatestAiTextFromState(stateMessages));
       if (recoveredText.length > 0) {
-        return { finalText: recoveredText, streamedTextDelivered, toolTraces, approvalProposals };
+        return {
+          finalText: recoveredText,
+          streamedTextDelivered,
+          toolTraces,
+          approvalProposals,
+          summaryProposals,
+        };
       }
     } catch (stateError) {
       console.error('Failed to recover final assistant text from state:', stateError);
     }
-    return { finalText: '', streamedTextDelivered, toolTraces, approvalProposals };
+    return { finalText: '', streamedTextDelivered, toolTraces, approvalProposals, summaryProposals };
     },
   });
 };

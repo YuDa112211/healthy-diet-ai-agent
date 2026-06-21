@@ -315,6 +315,22 @@ describe('visible text sanitization', () => {
 
     expect(sanitized).toBe(['我目前可以幫你做這些事：', '1. 分析食物照片'].join('\n\n'));
   });
+
+  test('hides partial thought tags during streaming accumulation', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const sanitizeAssistantStreamingText = getRequiredFunction<
+      (message: string) => string
+    >(
+      (agentRuntime as Record<string, unknown>).sanitizeAssistantStreamingText,
+      'sanitizeAssistantStreamingText'
+    );
+
+    expect(sanitizeAssistantStreamingText('測試猿你好！<tho')).toBe('測試猿你好！');
+    expect(sanitizeAssistantStreamingText('測試猿你好！<thought>內部推理')).toBe('測試猿你好！');
+    expect(
+      sanitizeAssistantStreamingText('測試猿你好！<thought>內部推理</thought>今天建議清淡飲食')
+    ).toBe('測試猿你好！今天建議清淡飲食');
+  });
 });
 
 describe('stream chunk accumulation', () => {

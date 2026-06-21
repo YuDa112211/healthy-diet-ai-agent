@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { getUserProfileTool, updateUserProfileTool } from '../agent_skills/db_tools';
+import { getUserProfileTool, logDietTool, updateUserProfileTool } from '../agent_skills/db_tools';
 import { createLocalOnlyStructuredOutputBinder, runAgentStream } from './server/agentRuntime';
 import { ChatRequestSchema, type ChatRequestPayload } from './server/chatPayload';
 import {
@@ -34,6 +34,7 @@ import {
 } from './server/profileApproval';
 import { AI_API_URL, isSupabaseReady, supabase } from './server/supabaseRuntime';
 import { imagesStaticMiddleware } from './server/workspacePaths';
+import type { ConversationSummaryToolResult } from '../agent_skills/conversation_summary_tool';
 
 export {
   AI_API_URL,
@@ -46,18 +47,11 @@ export {
   urlencodedBodyParser,
 };
 
-const ConversationSummarySchema = z.object({
-  summary: z.array(z.string()).default([]),
-});
-
-type ConversationSummary = z.infer<typeof ConversationSummarySchema>;
-
 const ConversationTitleSchema = z.object({
   title: z.string().default(''),
 });
 
 const localStructuredOutput = createLocalOnlyStructuredOutputBinder();
-const summaryExtractor = localStructuredOutput.withStructuredOutput(ConversationSummarySchema);
 const titleExtractor = localStructuredOutput.withStructuredOutput(ConversationTitleSchema);
 
 type UserProfileCacheEntry = {
@@ -104,56 +98,6 @@ const formatSummaryContext = (summaryArray: string[]): string => {
 
   const lines = summaryArray.map((item, index) => `${index + 1}. ${item}`);
   return ['Previous conversation summaries:', ...lines].join('\n');
-};
-
-const buildFallbackSummary = (
-  previousSummary: string[],
-  userMessage: string,
-  aiResponse: string
-): string[] => {
-  const condensed = `User: ${userMessage.trim()} | AI: ${aiResponse.trim()}`.slice(0, 260);
-  return [...previousSummary, condensed].slice(-20);
-};
-
-const extractConversationSummary = async (
-  previousSummary: string[],
-  userMessage: string,
-  aiResponse: string
-): Promise<ConversationSummary> => {
-  try {
-    const structured = await summaryExtractor.invoke([
-      {
-        role: 'system',
-        content: [
-          'You are a conversation summarizer.',
-          'Return JSON only with key: summary (array of short strings).',
-          'Merge previous summary with latest exchange and keep the most useful points.',
-          'Keep each item concise and avoid duplicates.',
-          'Do not include markdown.',
-        ].join('\n'),
-      },
-      {
-        role: 'user',
-        content: [
-          `Previous summary array: ${JSON.stringify(previousSummary)}`,
-          `User message: ${userMessage}`,
-          `AI response: ${aiResponse}`,
-        ].join('\n\n'),
-      },
-    ]);
-
-    const normalizedSummary = (structured.summary ?? [])
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0)
-      .slice(-20);
-
-    return { summary: normalizedSummary };
-  } catch (error) {
-    console.error('Summary extraction failed, using fallback:', error);
-    return {
-      summary: buildFallbackSummary(previousSummary, userMessage, aiResponse),
-    };
-  }
 };
 
 const generateConversationTitle = async (
@@ -217,10 +161,48 @@ const persistChatHistoryReply = async (input: {
   }
 };
 
+const persistChatRoomMetaWithClient = async (
+  client: NonNullable<typeof supabase>,
+  input: {
+    threadId: string;
+    userId?: string;
+    summaryArray?: string[];
+    compactSummary?: string;
+    title?: string;
+  }
+) => {
+  const nowIso = new Date().toISOString();
+  const payload: Record<string, unknown> = {
+    room_id: input.threadId,
+    updated_at: nowIso,
+    last_message_at: nowIso,
+  };
+
+  if (input.userId) payload.user_id = input.userId;
+  if (typeof input.compactSummary === 'string') {
+    payload.summary = input.compactSummary;
+  } else if (Array.isArray(input.summaryArray)) {
+    payload.summary = input.summaryArray;
+  }
+  if (input.title) payload.title = normalizeTitle(input.title, 'New conversation');
+
+  const onConflict = input.userId ? 'room_id,user_id' : 'room_id';
+  const { error } = await client
+    .from('chat_rooms')
+    .upsert(payload, { onConflict });
+
+  if (error) {
+    throw new Error(`Failed to upsert chat_rooms: ${error.message}`);
+  }
+};
+
+export const persistChatRoomMetaWithClientForTest = persistChatRoomMetaWithClient;
+
 const persistChatRoomMeta = async (input: {
   threadId: string;
   userId?: string;
-  summaryArray: string[];
+  summaryArray?: string[];
+  compactSummary?: string;
   title?: string;
 }) => {
   if (!supabase) {
@@ -228,57 +210,112 @@ const persistChatRoomMeta = async (input: {
     return;
   }
 
-  const nowIso = new Date().toISOString();
-  const payload: Record<string, unknown> = {
-    room_id: input.threadId,
-    summary: input.summaryArray,
-    updated_at: nowIso,
-    last_message_at: nowIso,
-  };
+  await persistChatRoomMetaWithClient(supabase, input);
+};
 
-  if (input.userId) payload.user_id = input.userId;
-  if (input.title) payload.title = normalizeTitle(input.title, 'New conversation');
+const normalizeChatRoomSummary = (rawSummary: unknown): string => {
+  if (typeof rawSummary === 'string') return rawSummary.trim();
+  if (Array.isArray(rawSummary)) {
+    return rawSummary
+      .map((item) => (typeof item === 'string' ? item.trim() : ''))
+      .filter((item) => item.length > 0)
+      .join('\n');
+  }
+  if (rawSummary && typeof rawSummary === 'object') {
+    try {
+      return JSON.stringify(rawSummary);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+};
 
-  const { error } = await supabase
+const fetchExistingRoomSummary = async (threadId: string, userId?: string): Promise<string> => {
+  if (!supabase) return '';
+
+  let query = supabase
     .from('chat_rooms')
-    .upsert(payload, { onConflict: 'room_id' });
+    .select('summary')
+    .eq('room_id', threadId)
+    .limit(1);
 
-  if (!error) return;
-
-  const conflictConstraintMissing =
-    error.code === '42P10' ||
-    error.message.includes('no unique or exclusion constraint matching the ON CONFLICT specification');
-
-  if (!conflictConstraintMissing) {
-    throw new Error(`Failed to upsert chat_rooms: ${error.message}`);
+  if (userId) {
+    query = query.eq('user_id', userId);
   }
 
-  console.warn(
-    '[persistChatRoomMeta] room_id is not unique in chat_rooms; fallback to update-then-insert flow.'
-  );
-
-  const { data: updatedRows, error: updateError } = await supabase
-    .from('chat_rooms')
-    .update(payload)
-    .eq('room_id', input.threadId)
-    .select('room_id');
-
-  if (updateError) {
-    throw new Error(`Fallback update chat_rooms failed: ${updateError.message}`);
+  const { data, error } = await query;
+  if (error) {
+    console.warn(`Failed to read chat_rooms summary for room_id=${threadId}: ${error.message}`);
+    return '';
   }
 
-  if (updatedRows && updatedRows.length > 0) {
+  const row = Array.isArray(data) && data.length > 0 ? data[0] : null;
+  return normalizeChatRoomSummary((row as { summary?: unknown } | null)?.summary);
+};
+
+const persistSummaryOutputs = async ({
+  threadId,
+  userId,
+  title,
+  summaryProposals,
+  persistChatRoomMetaFn = persistChatRoomMeta,
+  insertSummaryHistoryRowFn = async (input: {
+    threadId: string;
+    userId?: string;
+    detailedSummary: string;
+  }) =>
+    logDietTool.invoke({
+      room_id: input.threadId,
+      user_id: input.userId,
+      user_message: '[AUTO_SUMMARY]',
+      title: '對話摘要',
+      record_type: 'summary',
+      summary_text: input.detailedSummary,
+    }),
+}: {
+  threadId: string;
+  userId?: string;
+  title?: string;
+  summaryProposals: ConversationSummaryToolResult[];
+  persistChatRoomMetaFn?: typeof persistChatRoomMeta;
+  insertSummaryHistoryRowFn?: (input: {
+    threadId: string;
+    userId?: string;
+    detailedSummary: string;
+  }) => Promise<unknown>;
+}) => {
+  const latestSummaryProposal =
+    summaryProposals.length > 0 ? summaryProposals[summaryProposals.length - 1] : null;
+
+  if (latestSummaryProposal?.should_persist) {
+    await persistChatRoomMetaFn({
+      threadId,
+      userId,
+      compactSummary: latestSummaryProposal.compact_summary,
+      title,
+    });
+
+    const summaryResult = await insertSummaryHistoryRowFn({
+      threadId,
+      userId,
+      detailedSummary: latestSummaryProposal.detailed_summary,
+    });
+
+    if (typeof summaryResult === 'string' && summaryResult.startsWith('Failed')) {
+      throw new Error(summaryResult);
+    }
     return;
   }
 
-  const { error: insertError } = await supabase
-    .from('chat_rooms')
-    .insert(payload);
-
-  if (insertError) {
-    throw new Error(`Fallback insert chat_rooms failed: ${insertError.message}`);
-  }
+  await persistChatRoomMetaFn({
+    threadId,
+    userId,
+    title,
+  });
 };
+
+export const persistSummaryOutputsForTest = persistSummaryOutputs;
 
 const formatUserProfileContext = (raw: string, userId?: string): string => {
   try {
@@ -462,6 +499,7 @@ export const chatHandler = async (req: Request, res: Response) => {
     const combinedContext = [
       formatSummaryContext(normalizedUserContext),
       userProfileContext,
+      `Current room summary: ${await fetchExistingRoomSummary(payload.thread_id, normalizedUserId) || 'None.'}`,
     ].join('\n\n');
 
     const streamResult = await withTimeout(
@@ -480,6 +518,7 @@ export const chatHandler = async (req: Request, res: Response) => {
     const streamedTextDelivered = streamResult.streamedTextDelivered;
     const toolTraces = streamResult.toolTraces;
     const approvalProposals = streamResult.approvalProposals;
+    const summaryProposals = streamResult.summaryProposals;
     let approvalPending = false;
     let approvalContent = '';
     let approvalProposal: ProfileUpdateFields | null = null;
@@ -572,21 +611,15 @@ export const chatHandler = async (req: Request, res: Response) => {
           aiReply: finalVisibleText,
         });
 
-        const { summary } = await extractConversationSummary(
-          normalizedUserContext,
-          effectiveUserMessage,
-          finalVisibleText
-        );
-
         const title = payload.is_new_conversation
           ? await generateConversationTitle(effectiveUserMessage, finalVisibleText)
           : undefined;
 
-        await persistChatRoomMeta({
+        await persistSummaryOutputs({
           threadId: payload.thread_id,
           userId: normalizedUserId,
-          summaryArray: summary,
           title,
+          summaryProposals,
         });
         console.log(
           `[REQ ${requestId}] persistence success chat_history_id=${payload.chat_history_id} room_id=${payload.thread_id}`

@@ -28,4 +28,12 @@ describe('getAiApiUrl', () => {
     expect(getAiApiUrl()).toBe(DEFAULT_AI_API_URL);
     expect(getAiApiUrl()).not.toContain('localhost');
   });
+
+  test('rewrites localhost AI_API_URL to host.docker.internal inside docker', async () => {
+    process.env.AI_API_URL = 'http://localhost:8080/v1/';
+
+    const { getAiApiUrl } = await import('./aiRuntime');
+
+    expect(getAiApiUrl({ isDocker: true })).toBe('http://host.docker.internal:8080/v1/');
+  });
 });

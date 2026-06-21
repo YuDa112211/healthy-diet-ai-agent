@@ -42,6 +42,7 @@ type HistoryRow = {
   ai_analysis_report: string | null;
   summary: string | null;
   diet_report: unknown;
+  record_type?: string | null;
 };
 
 const shorten = (text: string, max = 120): string => {
@@ -50,8 +51,21 @@ const shorten = (text: string, max = 120): string => {
   return `${normalized.slice(0, max - 1)}…`;
 };
 
-export const logDietTool = tool(
-  async ({
+type LogDietInput = {
+  room_id: string;
+  user_message: string;
+  image_path?: string;
+  title?: string;
+  ai_analysis_report?: string;
+  diet_report?: unknown;
+  user_id?: string;
+  record_type?: 'chat' | 'summary';
+  summary_text?: string;
+};
+
+const logDietWithClient = async (
+  client: NonNullable<typeof supabase>,
+  {
     room_id,
     user_message,
     image_path,
@@ -61,63 +75,74 @@ export const logDietTool = tool(
     user_id,
     record_type = 'chat',
     summary_text,
-  }) => {
+  }: LogDietInput,
+  options?: { summaryColumnEnabled?: boolean }
+) => {
+  const summaryColumnEnabled =
+    options?.summaryColumnEnabled ?? process.env.ENABLE_SUMMARY_COLUMN === 'true';
+
+  if (record_type === 'summary') {
+    if (!summaryColumnEnabled) {
+      return 'Summary column is disabled. Set ENABLE_SUMMARY_COLUMN=true to store summary rows.';
+    }
+    if (!summary_text || summary_text.trim().length === 0) {
+      return 'summary_text is required for record_type=summary.';
+    }
+
+    const summaryInsertData: Record<string, unknown> = {
+      room_id,
+      user_message,
+      title: title || user_message.slice(0, 60),
+      summary: summary_text,
+      ai_analysis_report: '',
+      record_type: 'summary',
+    };
+    if (user_id) summaryInsertData.user_id = user_id;
+
+    const { error } = await withTimeout(
+      client.from('diet_chat_history').insert([summaryInsertData]),
+      SUPABASE_QUERY_TIMEOUT_MS,
+      'insert summary row'
+    );
+    if (error) return `Failed to insert summary row: ${error.message}`;
+    return 'Summary row inserted.';
+  }
+
+  if (!ai_analysis_report || ai_analysis_report.trim().length === 0) {
+    return 'ai_analysis_report is required for chat record.';
+  }
+
+  const insertData: Record<string, unknown> = {
+    room_id,
+    user_message,
+    title: title || user_message.slice(0, 60),
+    ai_analysis_report,
+    diet_report,
+    record_type: 'chat',
+  };
+
+  if (image_path) insertData.image_path = image_path;
+  if (user_id) insertData.user_id = user_id;
+  if (summary_text && summaryColumnEnabled) insertData.summary = summary_text;
+
+  const { error } = await withTimeout(
+    client.from('diet_chat_history').insert([insertData]),
+    SUPABASE_QUERY_TIMEOUT_MS,
+    'insert chat row'
+  );
+  if (error) return `Failed to insert chat row: ${error.message}`;
+
+  return 'Chat row inserted.';
+};
+
+export const logDietWithClientForTest = logDietWithClient;
+
+export const logDietTool = tool(
+  async (input: LogDietInput) => {
     try {
       const { client, error: configError } = getSupabaseOrError();
       if (configError || !client) return configError || 'Supabase is not configured.';
-
-      const summaryColumnEnabled = process.env.ENABLE_SUMMARY_COLUMN === 'true';
-
-      if (record_type === 'summary') {
-        if (!summaryColumnEnabled) {
-          return 'Summary column is disabled. Set ENABLE_SUMMARY_COLUMN=true to store summary rows.';
-        }
-        if (!summary_text || summary_text.trim().length === 0) {
-          return 'summary_text is required for record_type=summary.';
-        }
-
-        const summaryInsertData: Record<string, unknown> = {
-          room_id,
-          user_message,
-          title: title || user_message.slice(0, 60),
-          summary: summary_text,
-          ai_analysis_report: '',
-        };
-        if (user_id) summaryInsertData.user_id = user_id;
-
-        const { error } = await withTimeout(
-          client.from('diet_chat_history').insert([summaryInsertData]),
-          SUPABASE_QUERY_TIMEOUT_MS,
-          'insert summary row'
-        );
-        if (error) return `Failed to insert summary row: ${error.message}`;
-        return 'Summary row inserted.';
-      }
-
-      if (!ai_analysis_report || ai_analysis_report.trim().length === 0) {
-        return 'ai_analysis_report is required for chat record.';
-      }
-
-      const insertData: Record<string, unknown> = {
-        room_id,
-        user_message,
-        title: title || user_message.slice(0, 60),
-        ai_analysis_report,
-        diet_report,
-      };
-
-      if (image_path) insertData.image_path = image_path;
-      if (user_id) insertData.user_id = user_id;
-      if (summary_text && summaryColumnEnabled) insertData.summary = summary_text;
-
-      const { error } = await withTimeout(
-        client.from('diet_chat_history').insert([insertData]),
-        SUPABASE_QUERY_TIMEOUT_MS,
-        'insert chat row'
-      );
-      if (error) return `Failed to insert chat row: ${error.message}`;
-
-      return 'Chat row inserted.';
+      return await logDietWithClient(client, input);
     } catch (error: any) {
       return `log_diet_history exception: ${error.message}`;
     }
@@ -141,17 +166,21 @@ export const logDietTool = tool(
 );
 
 export const getChatHistoryTool = tool(
-  async ({ room_id, limit = 8, format = 'compact', include_diet_report = false }) => {
+  async ({ room_id, limit = 8, format = 'compact', include_diet_report = false, record_type = 'all' }) => {
     const { client, error: configError } = getSupabaseOrError();
     if (configError || !client) return configError || 'Supabase is not configured.';
 
+    let query = client
+      .from('diet_chat_history')
+      .select('id, created_at, title, user_message, ai_analysis_report, summary, diet_report, record_type')
+      .eq('room_id', room_id);
+
+    if (record_type !== 'all') {
+      query = query.eq('record_type', record_type);
+    }
+
     const { data, error } = await withTimeout(
-      client
-        .from('diet_chat_history')
-        .select('id, created_at, title, user_message, ai_analysis_report, summary, diet_report')
-        .eq('room_id', room_id)
-        .order('created_at', { ascending: false })
-        .limit(limit),
+      query.order('created_at', { ascending: false }).limit(limit),
       SUPABASE_QUERY_TIMEOUT_MS,
       'get chat history'
     );
@@ -193,6 +222,7 @@ export const getChatHistoryTool = tool(
       limit: z.number().int().min(1).max(50).optional().default(8),
       format: z.enum(['compact', 'raw']).optional().default('compact'),
       include_diet_report: z.boolean().optional().default(false),
+      record_type: z.enum(['all', 'chat', 'summary']).optional().default('all'),
     }),
   }
 );
