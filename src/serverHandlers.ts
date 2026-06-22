@@ -40,6 +40,13 @@ import {
 import { AI_API_URL, isSupabaseReady, supabase } from './server/supabaseRuntime';
 import { imagesStaticMiddleware } from './server/workspacePaths';
 import type { ConversationSummaryToolResult } from '../agent_skills/conversation_summary_tool';
+import {
+  buildRoomSummaryIndexEntry,
+  formatRoomSummaryIndexContext,
+  parseRoomSummaryIndex,
+  summarizeRoomSummaryIndex,
+  type RoomSummaryIndexEntry,
+} from './server/roomSummaryIndex';
 
 export {
   AI_API_URL,
@@ -173,6 +180,7 @@ const persistChatRoomMetaWithClient = async (
     userId?: string;
     summaryArray?: string[];
     compactSummary?: string;
+    summaryIndexEntries?: RoomSummaryIndexEntry[];
     title?: string;
   }
 ) => {
@@ -184,7 +192,9 @@ const persistChatRoomMetaWithClient = async (
   };
 
   if (input.userId) payload.user_id = input.userId;
-  if (typeof input.compactSummary === 'string') {
+  if (Array.isArray(input.summaryIndexEntries)) {
+    payload.summary = input.summaryIndexEntries;
+  } else if (typeof input.compactSummary === 'string') {
     payload.summary = input.compactSummary;
   } else if (Array.isArray(input.summaryArray)) {
     payload.summary = input.summaryArray;
@@ -208,6 +218,7 @@ const persistChatRoomMeta = async (input: {
   userId?: string;
   summaryArray?: string[];
   compactSummary?: string;
+  summaryIndexEntries?: RoomSummaryIndexEntry[];
   title?: string;
 }) => {
   if (!supabase) {
@@ -216,27 +227,6 @@ const persistChatRoomMeta = async (input: {
   }
 
   await persistChatRoomMetaWithClient(supabase, input);
-};
-
-const normalizeChatRoomSummary = (rawSummary: unknown): string => {
-  if (typeof rawSummary === 'string') {
-    const trimmed = rawSummary.trim();
-    return trimmed === '[]' ? '' : trimmed;
-  }
-  if (Array.isArray(rawSummary)) {
-    return rawSummary
-      .map((item) => (typeof item === 'string' ? item.trim() : ''))
-      .filter((item) => item.length > 0)
-      .join('\n');
-  }
-  if (rawSummary && typeof rawSummary === 'object') {
-    try {
-      return JSON.stringify(rawSummary);
-    } catch {
-      return '';
-    }
-  }
-  return '';
 };
 
 export const shouldFallbackSummarizeTurn = (input: {
@@ -248,8 +238,11 @@ export const shouldFallbackSummarizeTurn = (input: {
   return userText.length > 0 && assistantText.length > 0;
 };
 
-const fetchExistingRoomSummary = async (threadId: string, userId?: string): Promise<string> => {
-  if (!supabase) return '';
+const fetchExistingRoomSummaryEntries = async (
+  threadId: string,
+  userId?: string
+): Promise<RoomSummaryIndexEntry[]> => {
+  if (!supabase) return [];
 
   let query = supabase
     .from('chat_rooms')
@@ -264,19 +257,26 @@ const fetchExistingRoomSummary = async (threadId: string, userId?: string): Prom
   const { data, error } = await query;
   if (error) {
     console.warn(`Failed to read chat_rooms summary for room_id=${threadId}: ${error.message}`);
-    return '';
+    return [];
   }
 
   const row = Array.isArray(data) && data.length > 0 ? data[0] : null;
-  return normalizeChatRoomSummary((row as { summary?: unknown } | null)?.summary);
+  return parseRoomSummaryIndex((row as { summary?: unknown } | null)?.summary);
+};
+
+const fetchExistingRoomSummary = async (threadId: string, userId?: string): Promise<string> => {
+  const entries = await fetchExistingRoomSummaryEntries(threadId, userId);
+  return summarizeRoomSummaryIndex(entries);
 };
 
 const persistSummaryOutputs = async ({
   threadId,
+  chatHistoryId,
   userId,
   title,
   summaryProposals,
   existingRoomSummary = '',
+  existingRoomSummaryEntries = [],
   userMessageForFallback = '',
   assistantReplyForFallback = '',
   persistChatRoomMetaFn = persistChatRoomMeta,
@@ -295,10 +295,12 @@ const persistSummaryOutputs = async ({
     }),
 }: {
   threadId: string;
+  chatHistoryId: string;
   userId?: string;
   title?: string;
   summaryProposals: ConversationSummaryToolResult[];
   existingRoomSummary?: string;
+  existingRoomSummaryEntries?: RoomSummaryIndexEntry[];
   userMessageForFallback?: string;
   assistantReplyForFallback?: string;
   persistChatRoomMetaFn?: typeof persistChatRoomMeta;
@@ -336,13 +338,6 @@ const persistSummaryOutputs = async ({
   }
 
   if (latestSummaryProposal?.should_persist) {
-    await persistChatRoomMetaFn({
-      threadId,
-      userId,
-      compactSummary: latestSummaryProposal.compact_summary,
-      title,
-    });
-
     const summaryResult = await insertSummaryHistoryRowFn({
       threadId,
       userId,
@@ -352,6 +347,28 @@ const persistSummaryOutputs = async ({
     if (typeof summaryResult === 'string' && summaryResult.startsWith('Failed')) {
       throw new Error(summaryResult);
     }
+
+    const summaryHistoryId =
+      summaryResult &&
+      typeof summaryResult === 'object' &&
+      'id' in (summaryResult as Record<string, unknown>) &&
+      typeof (summaryResult as Record<string, unknown>).id === 'string'
+        ? ((summaryResult as Record<string, unknown>).id as string)
+        : undefined;
+
+    await persistChatRoomMetaFn({
+      threadId,
+      userId,
+      summaryIndexEntries: [
+        ...existingRoomSummaryEntries,
+        buildRoomSummaryIndexEntry({
+          compactSummary: latestSummaryProposal.compact_summary,
+          chatHistoryId,
+          summaryHistoryId,
+        }),
+      ],
+      title,
+    });
     return;
   }
 
@@ -363,6 +380,7 @@ const persistSummaryOutputs = async ({
 };
 
 export const persistSummaryOutputsForTest = persistSummaryOutputs;
+export const formatRoomSummaryIndexContextForTest = formatRoomSummaryIndexContext;
 
 const formatUserProfileContext = (raw: string, userId?: string): string => {
   try {
@@ -547,10 +565,12 @@ export const chatHandler = async (req: Request, res: Response) => {
         : 'No user_id provided, skip profile lookup.';
     }
 
+    const roomSummaryEntries = await fetchExistingRoomSummaryEntries(payload.thread_id, normalizedUserId);
     const combinedContext = [
       formatSummaryContext(normalizedUserContext),
       userProfileContext,
-      `Current room summary: ${await fetchExistingRoomSummary(payload.thread_id, normalizedUserId) || 'None.'}`,
+      formatRoomSummaryIndexContext(roomSummaryEntries),
+      `Current room summary: ${summarizeRoomSummaryIndex(roomSummaryEntries) || 'None.'}`,
     ].join('\n\n');
 
     const streamResult = await withTimeout(
@@ -668,10 +688,17 @@ export const chatHandler = async (req: Request, res: Response) => {
 
         await persistSummaryOutputs({
           threadId: payload.thread_id,
+          chatHistoryId: payload.chat_history_id,
           userId: normalizedUserId,
           title,
           summaryProposals,
-          existingRoomSummary: await fetchExistingRoomSummary(payload.thread_id, normalizedUserId),
+          existingRoomSummary: summarizeRoomSummaryIndex(
+            await fetchExistingRoomSummaryEntries(payload.thread_id, normalizedUserId)
+          ),
+          existingRoomSummaryEntries: await fetchExistingRoomSummaryEntries(
+            payload.thread_id,
+            normalizedUserId
+          ),
           userMessageForFallback: effectiveUserMessage,
           assistantReplyForFallback: finalVisibleText,
         });

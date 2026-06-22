@@ -63,6 +63,17 @@ type LogDietInput = {
   summary_text?: string;
 };
 
+type GetChatHistoryInput = {
+  room_id: string;
+  limit?: number;
+  format?: 'compact' | 'raw';
+  include_diet_report?: boolean;
+  record_type?: 'all' | 'chat' | 'summary';
+  chat_history_ids?: string[];
+  date_from?: string;
+  date_to?: string;
+};
+
 const logDietWithClient = async (
   client: NonNullable<typeof supabase>,
   {
@@ -99,13 +110,20 @@ const logDietWithClient = async (
     };
     if (user_id) summaryInsertData.user_id = user_id;
 
-    const { error } = await withTimeout(
-      client.from('diet_chat_history').insert([summaryInsertData]),
+    const { error, data } = await withTimeout(
+      client.from('diet_chat_history').insert([summaryInsertData]).select('id'),
       SUPABASE_QUERY_TIMEOUT_MS,
       'insert summary row'
     );
     if (error) return `Failed to insert summary row: ${error.message}`;
-    return 'Summary row inserted.';
+    const insertedId =
+      Array.isArray(data) &&
+      data.length > 0 &&
+      data[0] &&
+      typeof (data[0] as { id?: unknown }).id === 'string'
+        ? ((data[0] as { id: string }).id)
+        : undefined;
+    return { status: 'inserted', id: insertedId };
   }
 
   if (!ai_analysis_report || ai_analysis_report.trim().length === 0) {
@@ -165,64 +183,97 @@ export const logDietTool = tool(
   }
 );
 
+const getChatHistoryWithClient = async (
+  client: NonNullable<typeof supabase>,
+  {
+    room_id,
+    limit = 8,
+    format = 'compact',
+    include_diet_report = false,
+    record_type = 'all',
+    chat_history_ids,
+    date_from,
+    date_to,
+  }: GetChatHistoryInput
+) => {
+  let query = client
+    .from('diet_chat_history')
+    .select('id, created_at, title, user_message, ai_analysis_report, summary, diet_report, record_type')
+    .eq('room_id', room_id);
+
+  if (record_type !== 'all') {
+    query = query.eq('record_type', record_type);
+  }
+
+  if (Array.isArray(chat_history_ids) && chat_history_ids.length > 0) {
+    query = query.in('id', chat_history_ids);
+  }
+
+  if (typeof date_from === 'string' && date_from.trim().length > 0) {
+    query = query.gte('created_at', date_from);
+  }
+
+  if (typeof date_to === 'string' && date_to.trim().length > 0) {
+    query = query.lte('created_at', date_to);
+  }
+
+  const { data, error } = await withTimeout(
+    query.order('created_at', { ascending: false }).limit(limit),
+    SUPABASE_QUERY_TIMEOUT_MS,
+    'get chat history'
+  );
+
+  if (error) return `Failed to read history: ${error.message}`;
+
+  const rows = ((data ?? []) as HistoryRow[]).slice().reverse();
+
+  if (format === 'raw') return JSON.stringify(rows);
+  if (rows.length === 0) return 'No history found for this room.';
+
+  const lines: string[] = [];
+  for (const row of rows) {
+    const time = row.created_at ? new Date(row.created_at).toISOString() : 'unknown_time';
+    const header = row.title?.trim() ? `[${time}] ${row.title.trim()}` : `[${time}] conversation`;
+    lines.push(header);
+
+    if (row.summary?.trim()) {
+      lines.push(`- summary: ${shorten(row.summary, 260)}`);
+    } else {
+      if (row.user_message?.trim()) lines.push(`- user: ${shorten(row.user_message, 140)}`);
+      if (row.ai_analysis_report?.trim()) lines.push(`- assistant: ${shorten(row.ai_analysis_report, 200)}`);
+    }
+
+    if (include_diet_report && row.diet_report != null) {
+      lines.push(`- diet_report: ${shorten(JSON.stringify(row.diet_report), 180)}`);
+    }
+
+    lines.push('');
+  }
+
+  return lines.join('\n').trim();
+};
+
+export const getChatHistoryWithClientForTest = getChatHistoryWithClient;
+
 export const getChatHistoryTool = tool(
-  async ({ room_id, limit = 8, format = 'compact', include_diet_report = false, record_type = 'all' }) => {
+  async (input: GetChatHistoryInput) => {
     const { client, error: configError } = getSupabaseOrError();
     if (configError || !client) return configError || 'Supabase is not configured.';
-
-    let query = client
-      .from('diet_chat_history')
-      .select('id, created_at, title, user_message, ai_analysis_report, summary, diet_report, record_type')
-      .eq('room_id', room_id);
-
-    if (record_type !== 'all') {
-      query = query.eq('record_type', record_type);
-    }
-
-    const { data, error } = await withTimeout(
-      query.order('created_at', { ascending: false }).limit(limit),
-      SUPABASE_QUERY_TIMEOUT_MS,
-      'get chat history'
-    );
-
-    if (error) return `Failed to read history: ${error.message}`;
-
-    const rows = ((data ?? []) as HistoryRow[]).slice().reverse();
-
-    if (format === 'raw') return JSON.stringify(rows);
-    if (rows.length === 0) return 'No history found for this room.';
-
-    const lines: string[] = [];
-    for (const row of rows) {
-      const time = row.created_at ? new Date(row.created_at).toISOString() : 'unknown_time';
-      const header = row.title?.trim() ? `[${time}] ${row.title.trim()}` : `[${time}] conversation`;
-      lines.push(header);
-
-      if (row.summary?.trim()) {
-        lines.push(`- summary: ${shorten(row.summary, 260)}`);
-      } else {
-        if (row.user_message?.trim()) lines.push(`- user: ${shorten(row.user_message, 140)}`);
-        if (row.ai_analysis_report?.trim()) lines.push(`- assistant: ${shorten(row.ai_analysis_report, 200)}`);
-      }
-
-      if (include_diet_report && row.diet_report != null) {
-        lines.push(`- diet_report: ${shorten(JSON.stringify(row.diet_report), 180)}`);
-      }
-
-      lines.push('');
-    }
-
-    return lines.join('\n').trim();
+    return getChatHistoryWithClient(client, input);
   },
   {
     name: 'get_chat_history',
-    description: 'Read chat history by room id. format=compact returns readable summary, format=raw returns JSON string.',
+    description:
+      'Read chat history by room id. format=compact returns readable summary, format=raw returns JSON string. Optional chat_history_ids and date range can target detailed turns referenced by summary index entries.',
     schema: z.object({
       room_id: z.string().describe('Room id'),
       limit: z.number().int().min(1).max(50).optional().default(8),
       format: z.enum(['compact', 'raw']).optional().default('compact'),
       include_diet_report: z.boolean().optional().default(false),
       record_type: z.enum(['all', 'chat', 'summary']).optional().default('all'),
+      chat_history_ids: z.array(z.string()).optional().describe('Optional explicit history ids to retrieve.'),
+      date_from: z.string().optional().describe('Optional ISO datetime lower bound for created_at.'),
+      date_to: z.string().optional().describe('Optional ISO datetime upper bound for created_at.'),
     }),
   }
 );

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  formatRoomSummaryIndexContextForTest,
   persistChatRoomMetaWithClientForTest,
   persistSummaryOutputsForTest,
   shouldFallbackSummarizeTurn,
@@ -25,7 +26,17 @@ describe('persistChatRoomMetaWithClientForTest', () => {
     await persistChatRoomMetaWithClientForTest(fakeSupabase as never, {
       threadId: 'room-1',
       userId: '00000000-0000-0000-0000-000000000001',
-      compactSummary: 'summary text',
+      summaryIndexEntries: [
+        {
+          summary_id: 'sum-1',
+          summary: 'summary text',
+          source_chat_history_ids: ['chat-1'],
+          source_summary_history_id: 'summary-row-1',
+          created_at: '2026-06-22T10:00:00.000Z',
+          start_at: '2026-06-22T09:58:00.000Z',
+          end_at: '2026-06-22T10:00:00.000Z',
+        },
+      ],
       title: 'title',
     });
 
@@ -33,20 +44,30 @@ describe('persistChatRoomMetaWithClientForTest', () => {
     expect(calls[0]?.onConflict).toBe('room_id,user_id');
     expect(calls[0]?.payload.room_id).toBe('room-1');
     expect(calls[0]?.payload.user_id).toBe('00000000-0000-0000-0000-000000000001');
-    expect(calls[0]?.payload.summary).toBe('summary text');
+    expect(calls[0]?.payload.summary).toEqual([
+      {
+        summary_id: 'sum-1',
+        summary: 'summary text',
+        source_chat_history_ids: ['chat-1'],
+        source_summary_history_id: 'summary-row-1',
+        created_at: '2026-06-22T10:00:00.000Z',
+        start_at: '2026-06-22T09:58:00.000Z',
+        end_at: '2026-06-22T10:00:00.000Z',
+      },
+    ]);
     expect(calls[0]?.payload.title).toBe('title');
   });
 });
 
 describe('persistSummaryOutputsForTest', () => {
   test('persists compact and detailed summaries only when the tool requests it', async () => {
-    const writes: string[] = [];
+    const writes: Array<Record<string, unknown>> = [];
 
     const fakeSupabase = {
       from() {
         return {
-          upsert() {
-            writes.push('room');
+          upsert(payload: Record<string, unknown>) {
+            writes.push(payload);
             return Promise.resolve({ error: null });
           },
         };
@@ -55,6 +76,7 @@ describe('persistSummaryOutputsForTest', () => {
 
     await persistSummaryOutputsForTest({
       threadId: 'room-1',
+      chatHistoryId: 'chat-row-1',
       userId: '00000000-0000-0000-0000-000000000001',
       title: 'title',
       summaryProposals: [
@@ -69,12 +91,18 @@ describe('persistSummaryOutputsForTest', () => {
         await persistChatRoomMetaWithClientForTest(fakeSupabase as never, input);
       },
       insertSummaryHistoryRowFn: async () => {
-        writes.push('history');
-        return 'Summary row inserted.';
+        return { status: 'inserted', id: 'summary-row-1' };
       },
     });
 
-    expect(writes).toEqual(['room', 'history']);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.summary).toEqual([
+      expect.objectContaining({
+        summary: 'compact summary',
+        source_chat_history_ids: ['chat-row-1'],
+        source_summary_history_id: 'summary-row-1',
+      }),
+    ]);
   });
 
   test('updates only chat room metadata when no summary proposal is present', async () => {
@@ -93,6 +121,7 @@ describe('persistSummaryOutputsForTest', () => {
 
     await persistSummaryOutputsForTest({
       threadId: 'room-2',
+      chatHistoryId: 'chat-row-2',
       userId: '00000000-0000-0000-0000-000000000002',
       title: 'title',
       summaryProposals: [],
@@ -126,5 +155,35 @@ describe('shouldFallbackSummarizeTurn', () => {
         assistantReply: '',
       })
     ).toBe(false);
+  });
+});
+
+describe('formatRoomSummaryIndexContextForTest', () => {
+  test('formats structured summary entries into readable indexed context', () => {
+    const output = formatRoomSummaryIndexContextForTest([
+      {
+        summary_id: 'sum-1',
+        summary: '6/20 討論 168 斷食與當日飲食。',
+        source_chat_history_ids: ['chat-1'],
+        source_summary_history_id: 'summary-row-1',
+        created_at: '2026-06-20T08:30:00.000Z',
+        start_at: '2026-06-20T08:00:00.000Z',
+        end_at: '2026-06-20T08:30:00.000Z',
+      },
+      {
+        summary_id: 'sum-2',
+        summary: '6/21 分享弟弟一天的飲食。',
+        source_chat_history_ids: ['chat-5'],
+        source_summary_history_id: 'summary-row-2',
+        created_at: '2026-06-21T12:00:00.000Z',
+        start_at: '2026-06-21T11:40:00.000Z',
+        end_at: '2026-06-21T12:00:00.000Z',
+      },
+    ]);
+
+    expect(output).toContain('Room summary index:');
+    expect(output).toContain('1. [2026-06-20]');
+    expect(output).toContain('source_chat_history_ids=chat-1');
+    expect(output).toContain('2. [2026-06-21]');
   });
 });

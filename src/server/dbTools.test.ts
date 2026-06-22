@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
-import { logDietWithClientForTest } from '../../agent_skills/db_tools';
+import { getChatHistoryWithClientForTest, logDietWithClientForTest } from '../../agent_skills/db_tools';
 
 describe('logDietWithClientForTest', () => {
-  test('writes record_type=summary for summary inserts', async () => {
+  test('writes record_type=summary for summary inserts and returns inserted id', async () => {
     const payloads: Record<string, unknown>[] = [];
 
     const fakeClient = {
@@ -12,7 +12,11 @@ describe('logDietWithClientForTest', () => {
         return {
           insert(rows: Record<string, unknown>[]) {
             payloads.push(...rows);
-            return Promise.resolve({ error: null });
+            return {
+              select() {
+                return Promise.resolve({ error: null, data: [{ id: 'summary-row-1' }] });
+              },
+            };
           },
         };
       },
@@ -30,9 +34,120 @@ describe('logDietWithClientForTest', () => {
       { summaryColumnEnabled: true }
     );
 
-    expect(result).toBe('Summary row inserted.');
+    expect(result).toEqual({ status: 'inserted', id: 'summary-row-1' });
     expect(payloads).toHaveLength(1);
     expect(payloads[0]?.record_type).toBe('summary');
     expect(payloads[0]?.summary).toBe('detailed summary');
+  });
+});
+
+describe('getChatHistoryWithClientForTest', () => {
+  test('filters raw history by explicit chat history ids', async () => {
+    const fakeRows = [
+      {
+        id: 'chat-1',
+        created_at: '2026-06-20T08:00:00.000Z',
+        title: '早餐',
+        user_message: '我早餐吃蛋餅',
+        ai_analysis_report: '已記錄早餐內容',
+        summary: null,
+        diet_report: null,
+        record_type: 'chat',
+      },
+    ];
+
+    const filters: Array<{ type: string; value: unknown }> = [];
+
+    const fakeClient = {
+      from(table: string) {
+        expect(table).toBe('diet_chat_history');
+        return {
+          select() {
+            return this;
+          },
+          eq(column: string, value: unknown) {
+            filters.push({ type: `eq:${column}`, value });
+            return this;
+          },
+          in(column: string, value: unknown[]) {
+            filters.push({ type: `in:${column}`, value });
+            return this;
+          },
+          order() {
+            return this;
+          },
+          limit() {
+            return Promise.resolve({ data: fakeRows, error: null });
+          },
+        };
+      },
+    };
+
+    const result = await getChatHistoryWithClientForTest(fakeClient as never, {
+      room_id: 'room-1',
+      format: 'raw',
+      chat_history_ids: ['chat-1'],
+    });
+
+    expect(filters).toContainEqual({ type: 'eq:room_id', value: 'room-1' });
+    expect(filters).toContainEqual({ type: 'in:id', value: ['chat-1'] });
+    expect(result).toContain('"id":"chat-1"');
+  });
+
+  test('filters compact history by date range', async () => {
+    const fakeRows = [
+      {
+        id: 'chat-2',
+        created_at: '2026-06-21T12:00:00.000Z',
+        title: '午餐',
+        user_message: '我午餐吃雞胸肉',
+        ai_analysis_report: '蛋白質足夠',
+        summary: null,
+        diet_report: null,
+        record_type: 'chat',
+      },
+    ];
+
+    const filters: Array<{ type: string; value: unknown }> = [];
+
+    const fakeClient = {
+      from() {
+        return {
+          select() {
+            return this;
+          },
+          eq(column: string, value: unknown) {
+            filters.push({ type: `eq:${column}`, value });
+            return this;
+          },
+          gte(column: string, value: unknown) {
+            filters.push({ type: `gte:${column}`, value });
+            return this;
+          },
+          lte(column: string, value: unknown) {
+            filters.push({ type: `lte:${column}`, value });
+            return this;
+          },
+          order() {
+            return this;
+          },
+          limit() {
+            return Promise.resolve({ data: fakeRows, error: null });
+          },
+        };
+      },
+    };
+
+    const result = await getChatHistoryWithClientForTest(fakeClient as never, {
+      room_id: 'room-1',
+      format: 'compact',
+      date_from: '2026-06-21T00:00:00.000Z',
+      date_to: '2026-06-21T23:59:59.999Z',
+    });
+
+    expect(filters).toContainEqual({ type: 'gte:created_at', value: '2026-06-21T00:00:00.000Z' });
+    expect(filters).toContainEqual({ type: 'lte:created_at', value: '2026-06-21T23:59:59.999Z' });
+    expect(result).toContain('午餐');
+    expect(result).toContain('我午餐吃雞胸肉');
   });
 });

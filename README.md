@@ -319,6 +319,13 @@ Tables referenced by code include:
 - `users`
 - `knowledge_documents`
 
+Conversation memory behavior:
+
+- `chat_rooms.summary` now acts as a lightweight summary index for the room instead of a single opaque summary string.
+- Each summary index entry stores a compact summary plus `source_chat_history_ids` and optional `source_summary_history_id` links back to `diet_chat_history`.
+- `diet_chat_history` remains the source of truth for full user/assistant turns and archival summary rows.
+- Legacy Supabase backfill SQL: `Doc/supabase/2026-06-22-chat-room-summary-index-migration.sql`
+
 ## Knowledge Sources
 
 Primary knowledge content lives in:

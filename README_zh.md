@@ -318,6 +318,13 @@ bun run start
 - `users`
 - `knowledge_documents`
 
+對話記憶行為：
+
+- `chat_rooms.summary` 現在作為聊天室的輕量摘要索引，不再只是單一長字串摘要。
+- 每一筆摘要索引都會保存簡短摘要，並帶有 `source_chat_history_ids` 與可選的 `source_summary_history_id`，可回指 `diet_chat_history`。
+- `diet_chat_history` 仍然是完整使用者/助手對話與封存摘要列的真實來源。
+- 舊資料回填 SQL：`Doc/supabase/2026-06-22-chat-room-summary-index-migration.sql`
+
 ## 知識來源與文件位置
 
 主要知識檔案：
