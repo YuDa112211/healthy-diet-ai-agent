@@ -51,6 +51,40 @@ const shorten = (text: string, max = 120): string => {
   return `${normalized.slice(0, max - 1)}…`;
 };
 
+const isMissingColumnError = (error: unknown, column: string): boolean => {
+  const message =
+    error &&
+    typeof error === 'object' &&
+    'message' in (error as Record<string, unknown>) &&
+    typeof (error as Record<string, unknown>).message === 'string'
+      ? (error as Record<string, unknown>).message
+      : '';
+
+  return message.includes(`'${column}' column`) || message.includes(`"${column}" column`);
+};
+
+const insertDietChatHistoryRow = async (
+  client: NonNullable<typeof supabase>,
+  insertData: Record<string, unknown>,
+  label: string
+) => {
+  const attemptInsert = async (row: Record<string, unknown>) =>
+    withTimeout(
+      client.from('diet_chat_history').insert([row]).select('id'),
+      SUPABASE_QUERY_TIMEOUT_MS,
+      label
+    );
+
+  let result = await attemptInsert(insertData);
+
+  if (result.error && 'title' in insertData && isMissingColumnError(result.error, 'title')) {
+    const { title: _ignoredTitle, ...fallbackRow } = insertData;
+    result = await attemptInsert(fallbackRow);
+  }
+
+  return result;
+};
+
 type LogDietInput = {
   room_id: string;
   user_message: string;
@@ -110,9 +144,9 @@ const logDietWithClient = async (
     };
     if (user_id) summaryInsertData.user_id = user_id;
 
-    const { error, data } = await withTimeout(
-      client.from('diet_chat_history').insert([summaryInsertData]).select('id'),
-      SUPABASE_QUERY_TIMEOUT_MS,
+    const { error, data } = await insertDietChatHistoryRow(
+      client,
+      summaryInsertData,
       'insert summary row'
     );
     if (error) return `Failed to insert summary row: ${error.message}`;
@@ -143,11 +177,7 @@ const logDietWithClient = async (
   if (user_id) insertData.user_id = user_id;
   if (summary_text && summaryColumnEnabled) insertData.summary = summary_text;
 
-  const { error, data } = await withTimeout(
-    client.from('diet_chat_history').insert([insertData]).select('id'),
-    SUPABASE_QUERY_TIMEOUT_MS,
-    'insert chat row'
-  );
+  const { error, data } = await insertDietChatHistoryRow(client, insertData, 'insert chat row');
   if (error) return `Failed to insert chat row: ${error.message}`;
 
   const insertedId =

@@ -3,6 +3,50 @@ import { describe, expect, test } from 'bun:test';
 import { getChatHistoryWithClientForTest, logDietWithClientForTest } from '../../agent_skills/db_tools';
 
 describe('logDietWithClientForTest', () => {
+  test('retries chat inserts without title when the database schema does not expose that column', async () => {
+    const payloads: Record<string, unknown>[] = [];
+
+    const fakeClient = {
+      from(table: string) {
+        expect(table).toBe('diet_chat_history');
+        return {
+          insert(rows: Record<string, unknown>[]) {
+            payloads.push(...rows);
+            const row = rows[0] || {};
+            return {
+              select() {
+                if ('title' in row) {
+                  return Promise.resolve({
+                    error: {
+                      message: "Could not find the 'title' column of 'diet_chat_history' in the schema cache",
+                    },
+                    data: null,
+                  });
+                }
+
+                return Promise.resolve({ error: null, data: [{ id: 'chat-row-fallback-1' }] });
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const result = await logDietWithClientForTest(fakeClient as never, {
+      room_id: 'room-1',
+      user_message: '外食時要怎麼點得更健康？',
+      user_id: '00000000-0000-0000-0000-000000000001',
+      title: '外食時要怎麼點得更健康',
+      ai_analysis_report: '__PENDING__',
+      record_type: 'chat',
+    });
+
+    expect(result).toEqual({ status: 'inserted', id: 'chat-row-fallback-1' });
+    expect(payloads).toHaveLength(2);
+    expect(payloads[0]).toHaveProperty('title');
+    expect(payloads[1]).not.toHaveProperty('title');
+  });
+
   test('returns inserted id for chat rows so the agent can persist the later AI reply', async () => {
     const payloads: Record<string, unknown>[] = [];
 
