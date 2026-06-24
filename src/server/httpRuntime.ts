@@ -115,15 +115,30 @@ const sanitizeForLog = (body: unknown): Record<string, unknown> => {
 export const requestLoggerMiddleware = (req: Request, res: Response, next: (err?: unknown) => void) => {
   const requestId = req.header('x-request-id')?.trim() || createRequestId();
   const startAt = Date.now();
+  const isPingRequest = req.method === 'GET' && req.originalUrl === '/ping';
   res.locals.requestId = requestId;
 
-  console.log(
-    `[REQ ${requestId}] -> ${req.method} ${req.originalUrl} ip=${req.ip || 'unknown'} body=${JSON.stringify(
-      sanitizeForLog(req.body)
-    )}`
-  );
+  if (!isPingRequest) {
+    console.log(
+      `[REQ ${requestId}] -> ${req.method} ${req.originalUrl} ip=${req.ip || 'unknown'} body=${JSON.stringify(
+        sanitizeForLog(req.body)
+      )}`
+    );
+  }
 
   res.on('finish', () => {
+    if (isPingRequest && res.statusCode === 200) {
+      return;
+    }
+
+    if (isPingRequest) {
+      console.log(
+        `[REQ ${requestId}] -> ${req.method} ${req.originalUrl} ip=${req.ip || 'unknown'} body=${JSON.stringify(
+          sanitizeForLog(req.body)
+        )}`
+      );
+    }
+
     console.log(
       `[REQ ${requestId}] <- ${req.method} ${req.originalUrl} status=${res.statusCode} duration=${formatDurationMs(
         startAt
