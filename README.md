@@ -125,17 +125,26 @@ Example `POST /api/chat` body:
 {
   "message": "Please analyze this lunch",
   "thread_id": "thread-1",
-  "chat_history_id": "history-1",
   "user_id": "user-123",
+  "attachments": [
+    {
+      "kind": "image",
+      "name": "lunch.png",
+      "mime_type": "image/png",
+      "data_url": "data:image/png;base64,..."
+    }
+  ],
   "model_source": "auto"
 }
 ```
 
 Chat behavior notes:
 
+- the agent now creates the initial `diet_chat_history` row itself, so `chat_history_id` is no longer required from the caller
 - `model_source: "auto"` prefers Google when a Google key exists, otherwise falls back to local
 - `model_source: "local"` forces local model routing
 - if an image is included without text, the backend creates a fallback prompt
+- `attachments` may carry image metadata from the Rust proxy; the first image attachment is normalized into the existing image pipeline
 - if multiple URLs are present, only the first URL is verified in that turn
 - profile updates are proposed first, then written only after `POST /api/approve`
 

@@ -4,7 +4,6 @@ import { ChatRequestSchema } from './chatPayload';
 const basePayload = {
   message: 'Hello',
   thread_id: 'thread-1',
-  chat_history_id: 'history-1',
 };
 
 describe('ChatRequestSchema', () => {
@@ -47,10 +46,43 @@ describe('ChatRequestSchema', () => {
   test('still requires either message or image', () => {
     const result = ChatRequestSchema.safeParse({
       thread_id: 'thread-1',
-      chat_history_id: 'history-1',
       message: '   ',
     });
 
     expect(result.success).toBe(false);
+  });
+
+  test('accepts payloads without chat_history_id because the agent creates it', () => {
+    const result = ChatRequestSchema.safeParse({
+      message: 'Hello',
+      thread_id: 'thread-1',
+      user_id: 'user-1',
+      is_new_conversation: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+
+    expect(result.data.chat_history_id).toBeUndefined();
+  });
+
+  test('accepts attachment metadata arrays from the Rust proxy', () => {
+    const result = ChatRequestSchema.safeParse({
+      message: 'Please review the attached meal photo.',
+      thread_id: 'thread-1',
+      attachments: [
+        {
+          kind: 'image',
+          name: 'lunch.png',
+          mime_type: 'image/png',
+          data_url: 'data:image/png;base64,abc123',
+        },
+      ],
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+
+    expect(result.data.attachments).toHaveLength(1);
   });
 });

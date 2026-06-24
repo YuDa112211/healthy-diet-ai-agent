@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  createInitialChatPersistenceForTest,
   formatRoomSummaryIndexContextForTest,
   persistChatRoomMetaWithClientForTest,
   persistSummaryOutputsForTest,
@@ -56,6 +57,41 @@ describe('persistChatRoomMetaWithClientForTest', () => {
       },
     ]);
     expect(calls[0]?.payload.title).toBe('title');
+  });
+});
+
+describe('createInitialChatPersistenceForTest', () => {
+  test('upserts chat room and inserts an initial chat row before streaming begins', async () => {
+    const roomWrites: Array<Record<string, unknown>> = [];
+    const historyWrites: Array<Record<string, unknown>> = [];
+
+    const result = await createInitialChatPersistenceForTest({
+      threadId: 'room-1',
+      userId: '00000000-0000-0000-0000-000000000001',
+      userMessage: '午餐照片幫我分析一下',
+      imagePath: 'images/room-1/lunch.png',
+      isNewConversation: true,
+      persistChatRoomMetaFn: async (input) => {
+        roomWrites.push(input as unknown as Record<string, unknown>);
+      },
+      insertChatHistoryRowFn: async (input) => {
+        historyWrites.push(input as unknown as Record<string, unknown>);
+        return { status: 'inserted', id: 'chat-row-1' };
+      },
+    });
+
+    expect(result).toEqual({
+      chatHistoryId: 'chat-row-1',
+      provisionalTitle: '午餐照片幫我分析一下',
+    });
+    expect(roomWrites).toHaveLength(1);
+    expect(roomWrites[0]?.threadId).toBe('room-1');
+    expect(roomWrites[0]?.userId).toBe('00000000-0000-0000-0000-000000000001');
+    expect(roomWrites[0]?.title).toBe('午餐照片幫我分析一下');
+    expect(historyWrites).toHaveLength(1);
+    expect(historyWrites[0]?.threadId).toBe('room-1');
+    expect(historyWrites[0]?.imagePath).toBe('images/room-1/lunch.png');
+    expect(historyWrites[0]?.title).toBe('午餐照片幫我分析一下');
   });
 });
 

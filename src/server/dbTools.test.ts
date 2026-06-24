@@ -3,6 +3,40 @@ import { describe, expect, test } from 'bun:test';
 import { getChatHistoryWithClientForTest, logDietWithClientForTest } from '../../agent_skills/db_tools';
 
 describe('logDietWithClientForTest', () => {
+  test('returns inserted id for chat rows so the agent can persist the later AI reply', async () => {
+    const payloads: Record<string, unknown>[] = [];
+
+    const fakeClient = {
+      from(table: string) {
+        expect(table).toBe('diet_chat_history');
+        return {
+          insert(rows: Record<string, unknown>[]) {
+            payloads.push(...rows);
+            return {
+              select() {
+                return Promise.resolve({ error: null, data: [{ id: 'chat-row-1' }] });
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const result = await logDietWithClientForTest(fakeClient as never, {
+      room_id: 'room-1',
+      user_message: '早餐吃什麼比較好？',
+      user_id: '00000000-0000-0000-0000-000000000001',
+      title: '早餐吃什麼比較好',
+      ai_analysis_report: '先占位，稍後會改成完整 AI 回覆。',
+      record_type: 'chat',
+    });
+
+    expect(result).toEqual({ status: 'inserted', id: 'chat-row-1' });
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.record_type).toBe('chat');
+    expect(payloads[0]?.user_message).toBe('早餐吃什麼比較好？');
+  });
+
   test('writes record_type=summary for summary inserts and returns inserted id', async () => {
     const payloads: Record<string, unknown>[] = [];
 

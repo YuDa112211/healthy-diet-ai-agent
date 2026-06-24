@@ -143,14 +143,21 @@ const logDietWithClient = async (
   if (user_id) insertData.user_id = user_id;
   if (summary_text && summaryColumnEnabled) insertData.summary = summary_text;
 
-  const { error } = await withTimeout(
-    client.from('diet_chat_history').insert([insertData]),
+  const { error, data } = await withTimeout(
+    client.from('diet_chat_history').insert([insertData]).select('id'),
     SUPABASE_QUERY_TIMEOUT_MS,
     'insert chat row'
   );
   if (error) return `Failed to insert chat row: ${error.message}`;
 
-  return 'Chat row inserted.';
+  const insertedId =
+    Array.isArray(data) &&
+    data.length > 0 &&
+    data[0] &&
+    typeof (data[0] as { id?: unknown }).id === 'string'
+      ? ((data[0] as { id: string }).id)
+      : undefined;
+  return { status: 'inserted', id: insertedId };
 };
 
 export const logDietWithClientForTest = logDietWithClient;

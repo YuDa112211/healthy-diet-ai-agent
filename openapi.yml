@@ -1,0 +1,2684 @@
+openapi: 3.1.0
+info:
+  title: Healthy Diet AI Agent API
+  version: 1.0.0
+  summary: API contract generated from the currently registered Express routes in this project.
+  description: |
+    This OpenAPI document is derived from the live route registration in `src/index.ts`
+    and the corresponding router/handler implementations under `src/server/`.
+
+    Coverage includes every route currently registered by the application:
+    - chat and approval flow
+    - title generation
+    - admin knowledge upload and ingestion jobs
+    - MOHW news sync and local article access
+    - RAG keyword search
+    - RAG document management and source previews
+    - knowledge graph extraction, search, and inspection
+    - static image serving
+    - health check
+
+    Notes:
+    - `POST /api/chat` returns `text/event-stream` (SSE), not JSON.
+    - Some schemas below are inferred from implementation rather than explicit DTO types.
+    - Admin-protected routes accept either:
+      - `Authorization: Bearer <token>`
+      - or both `x-admin-user-id` and `x-admin-role: admin|nutritionist`
+servers:
+  - url: http://localhost:8001
+    description: Default local development server
+tags:
+  - name: Health
+  - name: Chat
+  - name: Approvals
+  - name: Titles
+  - name: Admin Knowledge
+  - name: MOHW News
+  - name: RAG Search
+  - name: RAG Documents
+  - name: Knowledge Graph
+  - name: Images
+paths:
+  /ping:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns a simple liveness payload for the Node.js API server.
+      operationId: ping
+      responses:
+        '200':
+          description: Server is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PingResponse'
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    message: Pong! Node.js Agent is alive.
+                    timestamp: '2026-06-24T08:15:30.123Z'
+
+  /api/chat:
+    post:
+      tags: [Chat]
+      summary: Stream a chat response
+      description: |
+        Main AI chat endpoint.
+
+        Behavior derived from implementation:
+        - Accepts text-only, image-only, or text+image requests.
+        - The caller no longer needs to send `chat_history_id`; the agent creates the initial history row itself.
+        - If `message` is empty but `image` exists, the server injects a fallback prompt.
+        - `attachments` may include image metadata forwarded by the Rust proxy. The first image attachment is normalized into the existing image pipeline.
+        - If multiple URLs are present in the user message, only the first URL is verified for that turn.
+        - The response is streamed as Server-Sent Events (`text/event-stream`).
+        - The stream may emit normal text, status updates, an approval interrupt, and a final `done` event.
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              textOnly:
+                value:
+                  message: 請幫我分析今天午餐的營養重點
+                  thread_id: thread-001
+                  user_id: user-123
+                  user_context:
+                    - 使用者正在減脂
+                    - 最近想控制鈉攝取
+                  is_new_conversation: true
+                  model_source: auto
+              imageOnly:
+                value:
+                  message: ''
+                  thread_id: thread-002
+                  user_id: user-456
+                  image: iVBORw0KGgoAAAANSUhEUgAA...
+                  image_mime_type: image/png
+                  is_new_conversation: false
+                  model_source: local
+      responses:
+        '200':
+          description: |
+            SSE stream started successfully.
+
+            Typical event sequence:
+            1. `status`
+            2. zero or more `text`
+            3. optional `interrupt` when profile updates require approval
+            4. `done`
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Raw Server-Sent Events stream
+              examples:
+                normal:
+                  value: |-
+                    event: status
+                    data: {"type":"status","content":"AI is preparing your response..."}
+
+                    event: status
+                    data: {"type":"status","content":"User message: 請幫我分析今天午餐的營養重點"}
+
+                    event: text
+                    data: {"type":"text","content":"這份餐點整體蛋白質足夠，但鈉含量可能偏高。"}
+
+                    event: done
+                    data: {"type":"done","user_message":"請幫我分析今天午餐的營養重點","tools":[{"name":"vision_model","status":"success"}],"approval_pending":false,"approval_id":null,"approval_content":"","approval_proposal":null,"approval_proposal_items":[]}
+                approvalInterrupt:
+                  value: |-
+                    event: status
+                    data: {"type":"status","content":"AI is preparing your response..."}
+
+                    event: interrupt
+                    data: {"type":"interrupt","content":"偵測到可更新的個人資料，是否同意寫入？","approval_id":"req_approve_001","proposal":{"height":168,"weight":61},"proposal_items":[{"field":"height","label":"身高","value":168},{"field":"weight","label":"體重","value":61}]}
+
+                    event: done
+                    data: {"type":"done","user_message":"我身高168體重61","tools":[{"name":"updateUserProfileTool","status":"proposed"}],"approval_pending":true,"approval_id":"req_approve_001","approval_content":"偵測到可更新的個人資料，是否同意寫入？","approval_proposal":{"height":168,"weight":61},"approval_proposal_items":[{"field":"height","label":"身高","value":168},{"field":"weight","label":"體重","value":61}]}
+        '400':
+          description: Invalid payload or invalid image payload
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/InvalidPayloadError'
+                  - $ref: '#/components/schemas/InvalidImagePayloadError'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayloadTooLargeError'
+
+  /api/approve:
+    post:
+      tags: [Approvals]
+      summary: Approve or reject a pending profile update
+      description: |
+        Completes the profile approval flow triggered by `POST /api/chat`.
+
+        Possible outcomes:
+        - `approved`: profile update tool executed successfully
+        - `rejected`: proposal was declined and no DB write occurred
+        - `not_found`: approval ID expired or does not exist
+        - `failed`: update tool execution failed
+      operationId: approveProfileUpdate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveRequest'
+            examples:
+              approve:
+                value:
+                  approval_id: req_approve_001
+                  action: approve
+              reject:
+                value:
+                  approval_id: req_approve_001
+                  action: reject
+      responses:
+        '200':
+          description: Approval request processed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ApproveApprovedResponse'
+                  - $ref: '#/components/schemas/ApproveRejectedResponse'
+                  - $ref: '#/components/schemas/ApproveNotFoundResponse'
+              examples:
+                approved:
+                  value:
+                    status: approved
+                    user_message: approve
+                    approval_id: req_approve_001
+                    result: Profile updated successfully
+                    summary: 身高更新為 168，體重更新為 61
+                    assistant_reply: 已替你更新個人資料，之後我會用新的資料提供建議。
+                    proposal:
+                      height: 168
+                      weight: 61
+                    proposal_items:
+                      - field: height
+                        label: 身高
+                        value: 168
+                      - field: weight
+                        label: 體重
+                        value: 61
+                    tool:
+                      name: updateUserProfileTool
+                      status: success
+                      result: Profile updated successfully
+                rejected:
+                  value:
+                    status: rejected
+                    message: 已取消這次個人資料更新
+                    user_message: reject
+                    approval_id: req_approve_001
+                    assistant_reply: 我先不更新個人資料，仍可繼續回答飲食問題。
+                    proposal:
+                      disease:
+                        - hypertension
+                    proposal_items:
+                      - field: disease
+                        label: 慢性疾病
+                        value:
+                          - hypertension
+                    tool:
+                      name: updateUserProfileTool
+                      status: skipped
+                notFound:
+                  value:
+                    status: not_found
+                    message: No pending profile update approval for this approval_id.
+        '400':
+          description: Invalid approval payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApproveInvalidPayloadResponse'
+        '500':
+          description: Failed to apply profile update
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApproveFailedResponse'
+
+  /api/generate_title:
+    post:
+      tags: [Titles]
+      summary: Generate a conversation title
+      description: Generates a short title from a user message using the local structured output binder.
+      operationId: generateConversationTitle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateTitleRequest'
+            examples:
+              default:
+                value:
+                  message: 幫我規劃一週低鈉高蛋白的晚餐
+      responses:
+        '200':
+          description: Title generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateTitleResponse'
+              examples:
+                default:
+                  value:
+                    title: 低鈉高蛋白晚餐規劃
+        '400':
+          description: Missing or invalid message
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: No message provided
+                required: [error]
+        '500':
+          description: Title generation failed, fallback title returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateTitleFallbackResponse'
+
+  /api/admin/knowledge/upload:
+    post:
+      tags: [Admin Knowledge]
+      summary: Upload a knowledge document using base64 JSON payload
+      description: |
+        Uploads a document record into `knowledge_documents` and stores the original file under
+        `knowledge_base/uploads/...`.
+
+        This route is separate from `/api/rag/documents`:
+        - `/api/admin/knowledge/upload` uses JSON with `file_base64`
+        - `/api/rag/documents` uses `multipart/form-data`
+      operationId: uploadKnowledgeDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeUploadRequest'
+            examples:
+              pdf:
+                value:
+                  file_name: low-sodium-guideline.pdf
+                  file_base64: JVBERi0xLjcKJcTl8uXr...
+                  mime_type: application/pdf
+                  title: Low Sodium Guideline
+                  uploaded_by: admin-user-1
+                  uploader_role: admin
+                  source_type: manual_upload
+                  tags:
+                    - sodium
+                    - guideline
+      responses:
+        '200':
+          description: Duplicate document found by SHA-256 hash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeUploadDuplicateResponse'
+        '201':
+          description: Document uploaded successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeUploadCreatedResponse'
+        '400':
+          description: Invalid payload or unsupported file metadata
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/InvalidPayloadError'
+                  - $ref: '#/components/schemas/UnsupportedExtensionError'
+                  - $ref: '#/components/schemas/UnsupportedMimeTypeError'
+                  - $ref: '#/components/schemas/SimpleError'
+        '413':
+          description: Uploaded file exceeds configured byte limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Supabase is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/admin/knowledge/ingest/{id}:
+    post:
+      tags: [Admin Knowledge]
+      summary: Extract text and convert an uploaded knowledge file into markdown
+      description: |
+        Creates a `knowledge_ingestion_jobs` row, extracts text from the source file,
+        writes parsed markdown to `knowledge_base/ingested_markdown/...`, and updates both job
+        and document status.
+      operationId: ingestKnowledgeDocument
+      parameters:
+        - $ref: '#/components/parameters/DocumentUuidId'
+      responses:
+        '200':
+          description: Ingestion completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeIngestSuccessResponse'
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidPayloadError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Ingestion job failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeIngestFailedResponse'
+        '503':
+          description: Supabase is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/admin/knowledge/jobs/{jobId}:
+    get:
+      tags: [Admin Knowledge]
+      summary: Get knowledge ingestion job status
+      operationId: getKnowledgeJobStatus
+      parameters:
+        - $ref: '#/components/parameters/JobUuidId'
+      responses:
+        '200':
+          description: Job found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeJobStatusResponse'
+        '400':
+          description: Invalid job ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidPayloadError'
+        '404':
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Query failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Supabase is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/news/sync:
+    post:
+      tags: [MOHW News]
+      summary: Sync MOHW/FDA clarification news into local markdown files
+      operationId: syncMohwNews
+      responses:
+        '200':
+          description: Sync completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MohwSyncResponse'
+              examples:
+                default:
+                  value:
+                    ok: true
+                    total: 128
+                    newCount: 3
+                    updatedCount: 2
+                    generatedAt: '2026-06-24T09:00:00.000Z'
+
+  /api/news:
+    get:
+      tags: [MOHW News]
+      summary: List locally synced MOHW news records
+      operationId: listMohwNews
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated list of synced news records
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MohwNewsListResponse'
+
+  /api/news/{id}:
+    get:
+      tags: [MOHW News]
+      summary: Get a MOHW news article with locally stored markdown content
+      operationId: getMohwNewsById
+      parameters:
+        - $ref: '#/components/parameters/NewsId'
+      responses:
+        '200':
+          description: News article found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MohwNewsDetailResponse'
+        '404':
+          description: News manifest entry or file not found
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/NewsNotFoundError'
+                  - $ref: '#/components/schemas/NewsFileNotFoundError'
+
+  /api/news-files:
+    get:
+      tags: [MOHW News]
+      summary: List local MOHW article markdown filenames
+      operationId: listMohwNewsFiles
+      responses:
+        '200':
+          description: Local markdown filenames
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MohwNewsFilesResponse'
+
+  /api/rag/search:
+    get:
+      tags: [RAG Search]
+      summary: Keyword search across nutrition rules, MOHW news, and uploaded knowledge
+      description: GET and POST variants share the same schema and response shape.
+      operationId: ragSearchGet
+      parameters:
+        - $ref: '#/components/parameters/RagSearchQuery'
+        - $ref: '#/components/parameters/RagSearchTopK'
+        - $ref: '#/components/parameters/RagSearchSourceTypes'
+        - $ref: '#/components/parameters/RagSearchForceRefresh'
+      responses:
+        '200':
+          description: Search completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagSearchResponse'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidPayloadWithOkFalseError'
+    post:
+      tags: [RAG Search]
+      summary: Keyword search across nutrition rules, MOHW news, and uploaded knowledge
+      operationId: ragSearchPost
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagSearchRequest'
+            examples:
+              default:
+                value:
+                  query: 高鈉 食物
+                  top_k: 5
+                  source_types:
+                    - nutrition_rules
+                    - mohw_news
+                  force_refresh: false
+      responses:
+        '200':
+          description: Search completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagSearchResponse'
+        '400':
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidPayloadWithOkFalseError'
+
+  /api/rag/documents:
+    get:
+      tags: [RAG Documents]
+      summary: List uploaded RAG documents
+      operationId: listRagDocuments
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      responses:
+        '200':
+          description: Document list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentListResponse'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+    post:
+      tags: [RAG Documents]
+      summary: Upload a RAG source document with multipart/form-data
+      description: |
+        Accepts a multipart file upload and immediately attempts reindexing into markdown.
+
+        Multipart fields:
+        - `file`: required binary file
+        - `embeddingModel`: optional string
+        - `uploadedBy`: optional string overriding identity for record attribution
+      operationId: uploadRagDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Original source file. Supported extensions are `pdf`, `docx`, `txt`, and `md`.
+                embeddingModel:
+                  type: string
+                  nullable: true
+                  description: Optional embedding model label stored with the document metadata.
+                uploadedBy:
+                  type: string
+                  nullable: true
+                  description: Optional uploader ID override. If omitted, the admin identity is used.
+              required: [file]
+      responses:
+        '200':
+          description: Duplicate file detected by SHA-256 hash; existing document returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentItem'
+        '201':
+          description: File uploaded and indexed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentItem'
+        '400':
+          description: Invalid multipart body or unsupported file type
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AdminAuthRequiredError'
+                  - $ref: '#/components/schemas/SimpleError'
+                  - $ref: '#/components/schemas/UnsupportedExtensionError'
+                  - $ref: '#/components/schemas/UnsupportedMimeTypeError'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '413':
+          description: File too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Upload failed unexpectedly
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/rag/documents/{document_id}:
+    get:
+      tags: [RAG Documents]
+      summary: Get one uploaded RAG document
+      operationId: getRagDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Document metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentItem'
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+    delete:
+      tags: [RAG Documents]
+      summary: Delete an uploaded RAG document and its derived markdown
+      operationId: deleteRagDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Document deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentDeleteResponse'
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/rag/documents/{document_id}/reindex:
+    post:
+      tags: [RAG Documents]
+      summary: Re-extract and reindex a RAG document
+      operationId: reindexRagDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Reindex completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentItem'
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/rag/documents/{document_id}/file:
+    get:
+      tags: [RAG Documents]
+      summary: Download or inline-open the original uploaded document
+      operationId: getRagDocumentFile
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Original binary/text document
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+            text/markdown:
+              schema:
+                type: string
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/rag/documents/{document_id}/preview:
+    get:
+      tags: [RAG Documents]
+      summary: Preview extracted text from the original uploaded document
+      operationId: previewRagDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Preview payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentPreviewResponse'
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/rag/sources/{document_id}/file:
+    get:
+      tags: [RAG Documents]
+      summary: Public source-file access for a RAG document
+      description: Same file stream as `/api/rag/documents/{document_id}/file` but without admin auth checks.
+      operationId: getRagSourceFile
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Original binary/text document
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+            text/markdown:
+              schema:
+                type: string
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/rag/sources/{document_id}/preview:
+    get:
+      tags: [RAG Documents]
+      summary: Public preview of extracted source text
+      operationId: previewRagSource
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Preview payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentPreviewResponse'
+        '400':
+          description: Invalid document ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidDocumentIdError'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentNotFoundError'
+        '503':
+          description: RAG document repository unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagUnavailableError'
+
+  /api/graph/extract-all:
+    post:
+      tags: [Knowledge Graph]
+      summary: Extract or refresh graph data for all known sources
+      operationId: extractAllGraph
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphExtractRequest'
+            examples:
+              default:
+                value:
+                  force: false
+      responses:
+        '200':
+          description: Extraction completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphExtractAllResponse'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '500':
+          description: Unhandled extraction error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /api/graph/status:
+    get:
+      tags: [Knowledge Graph]
+      summary: Read graph cache status summary
+      operationId: getGraphStatus
+      responses:
+        '200':
+          description: Graph cache summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphStatusResponse'
+
+  /api/graph/documents/{document_id}/extract:
+    post:
+      tags: [Knowledge Graph]
+      summary: Extract graph entities and relations for one source document
+      operationId: extractGraphDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphExtractRequest'
+      responses:
+        '200':
+          description: Extraction completed or served from unchanged cache
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphDocumentExtractResponse'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Source document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphDocumentNotFoundError'
+        '500':
+          description: Unhandled extraction error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /api/graph/documents/{document_id}:
+    get:
+      tags: [Knowledge Graph]
+      summary: Get extracted graph detail for one document
+      operationId: getGraphDocument
+      security:
+        - AdminBearer: []
+        - AdminUserId: []
+          AdminRole: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Graph document detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphDocumentDetailResponse'
+        '401':
+          description: Admin authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuthRequiredError'
+        '404':
+          description: Graph document not found in cache
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphDocumentCacheNotFoundError'
+        '500':
+          description: Unhandled error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /api/graph/search:
+    post:
+      tags: [Knowledge Graph]
+      summary: Search the extracted knowledge graph
+      operationId: searchGraph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphSearchRequest'
+            examples:
+              default:
+                value:
+                  query: broccoli
+                  max_nodes: 12
+                  source_types:
+                    - nutrition_rules
+                    - mohw_news
+      responses:
+        '200':
+          description: Graph subgraph result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphSearchResponse'
+        '500':
+          description: Unhandled error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /api/graph/nodes:
+    get:
+      tags: [Knowledge Graph]
+      summary: List graph nodes with optional filtering
+      operationId: listGraphNodes
+      parameters:
+        - $ref: '#/components/parameters/GraphNodeLimit'
+        - $ref: '#/components/parameters/GraphNodeType'
+        - $ref: '#/components/parameters/GraphNodeQuery'
+      responses:
+        '200':
+          description: Node list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphNodeListResponse'
+        '500':
+          description: Unhandled error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /api/graph/nodes/{node_id}:
+    get:
+      tags: [Knowledge Graph]
+      summary: Get one graph node with edges, neighbors, and evidence
+      operationId: getGraphNode
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: Node detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphNodeDetailResponse'
+        '404':
+          description: Graph node not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphNodeNotFoundError'
+        '500':
+          description: Unhandled error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /api/graph/relations/{relation_id}/evidence:
+    get:
+      tags: [Knowledge Graph]
+      summary: Get evidence snippets for one graph relation
+      operationId: getGraphRelationEvidence
+      parameters:
+        - $ref: '#/components/parameters/RelationId'
+      responses:
+        '200':
+          description: Relation and evidence found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphRelationEvidenceResponse'
+        '404':
+          description: Graph relation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphRelationNotFoundError'
+        '500':
+          description: Unhandled error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalServerError'
+
+  /images/{imagePath}:
+    get:
+      tags: [Images]
+      summary: Serve a previously stored image from the workspace image directory
+      description: |
+        Static file middleware mounted at `/images`.
+
+        The actual internal folder layout is managed by `src/server/workspacePaths.ts`.
+        Because nested paths may exist, clients should URL-encode `/` characters inside `imagePath`
+        when necessary.
+      operationId: getStoredImage
+      parameters:
+        - name: imagePath
+          in: path
+          required: true
+          description: Relative image path under the mounted static image root.
+          schema:
+            type: string
+          example: user-123/thread-001/meal-20260624-1.png
+      responses:
+        '200':
+          description: Image file
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: File not found
+components:
+  securitySchemes:
+    AdminBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Any non-empty Authorization header is treated as admin-capable by current implementation.
+    AdminUserId:
+      type: apiKey
+      in: header
+      name: x-admin-user-id
+      description: Admin user identifier header. Must be paired with `x-admin-role`.
+    AdminRole:
+      type: apiKey
+      in: header
+      name: x-admin-role
+      description: Admin role header. Allowed values are `admin` and `nutritionist`.
+  parameters:
+    DocumentId:
+      name: document_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+      example: doc-upload-1
+    DocumentUuidId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      example: 550e8400-e29b-41d4-a716-446655440000
+    JobUuidId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      example: 550e8400-e29b-41d4-a716-446655440999
+    NewsId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: '12345'
+    NodeId:
+      name: node_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: food:broccoli
+    RelationId:
+      name: relation_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: food:broccoli|contains|nutrient:fiber
+    Page:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      example: 1
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+      example: 10
+    RagSearchQuery:
+      name: query
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+      example: 高纖 食物
+    RagSearchTopK:
+      name: top_k
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 12
+        default: 5
+      example: 5
+    RagSearchSourceTypes:
+      name: source_types
+      in: query
+      required: false
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/KnowledgeSourceType'
+      example:
+        - nutrition_rules
+        - mohw_news
+    RagSearchForceRefresh:
+      name: force_refresh
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: false
+      example: false
+    GraphNodeLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+      example: 50
+    GraphNodeType:
+      name: node_type
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/GraphNodeType'
+      example: nutrient
+    GraphNodeQuery:
+      name: query
+      in: query
+      required: false
+      schema:
+        type: string
+        minLength: 1
+      example: fiber
+  schemas:
+    SimpleError:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+    InternalServerError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Internal server error
+      required: [error]
+    ValidationFlattenedDetails:
+      type: object
+      description: Flattened Zod validation output.
+      properties:
+        formErrors:
+          type: array
+          items:
+            type: string
+        fieldErrors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+    InvalidPayloadError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Invalid payload
+        details:
+          $ref: '#/components/schemas/ValidationFlattenedDetails'
+      required: [error, details]
+    InvalidPayloadWithOkFalseError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          example: invalid_payload
+        details:
+          $ref: '#/components/schemas/ValidationFlattenedDetails'
+      required: [ok, error, details]
+    InvalidImagePayloadError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Invalid image payload
+        message:
+          type: string
+      required: [error, message]
+    PayloadTooLargeError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Payload too large
+        message:
+          type: string
+          example: Request body exceeds 10mb. Please compress the image or lower resolution.
+      required: [error, message]
+    UnsupportedExtensionError:
+      type: object
+      properties:
+        error:
+          type: string
+        supported_extensions:
+          type: array
+          items:
+            type: string
+        supportedExtensions:
+          type: array
+          items:
+            type: string
+      required: [error]
+    UnsupportedMimeTypeError:
+      type: object
+      properties:
+        error:
+          type: string
+        supported_mime_types:
+          type: array
+          items:
+            type: string
+        supportedMimeTypes:
+          type: array
+          items:
+            type: string
+      required: [error]
+    PingResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        message:
+          type: string
+          example: Pong! Node.js Agent is alive.
+        timestamp:
+          type: string
+          format: date-time
+      required: [status, message, timestamp]
+    ChatModelSource:
+      type: string
+      enum: [auto, google, local]
+      description: |
+        Model routing preference:
+        - `auto`: prefer Google route when configured, otherwise fallback to local
+        - `google`: force Google-compatible routing
+        - `local`: force local OpenAI-compatible backend routing
+    ChatRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        message:
+          type: string
+          description: User message text. May be empty only when `image` is provided.
+          default: ''
+        thread_id:
+          type: string
+          minLength: 1
+          description: Conversation thread identifier used by the agent runtime.
+        chat_history_id:
+          type: string
+          minLength: 1
+          description: Deprecated optional compatibility field. The agent now creates the initial history row id itself.
+        user_id:
+          type: string
+          description: Optional user identifier for profile lookup and persistence.
+        user_context:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+          description: Optional prior client-provided context. The server normalizes it into readable strings.
+          default: []
+        image:
+          description: |
+            Optional image payload. The implementation accepts an unknown JSON value and passes it through
+            image decoding logic. In practice this is usually a base64 string or data URL.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+        image_mime_type:
+          type: string
+          description: Preferred snake_case MIME type field.
+        imageMimeType:
+          type: string
+          description: Alternate camelCase MIME type field accepted for compatibility.
+        attachments:
+          type: array
+          description: Optional attachment metadata forwarded by the Rust proxy. The first image attachment is treated like `image`.
+          items:
+            type: object
+            additionalProperties: true
+        is_new_conversation:
+          type: boolean
+          default: false
+          description: If true, the server attempts to generate a conversation title after the turn.
+        model_source:
+          $ref: '#/components/schemas/ChatModelSource'
+      required:
+        - thread_id
+      allOf:
+        - anyOf:
+            - required: [message]
+            - required: [image]
+            - required: [attachments]
+      examples:
+        - message: 請分析這份早餐
+          thread_id: thread-123
+          user_id: user-001
+          attachments:
+            - kind: image
+              mime_type: image/png
+              data_url: data:image/png;base64,...
+          model_source: auto
+    ApprovalProposalFields:
+      type: object
+      description: Inferred profile update proposal fields emitted by the agent.
+      properties:
+        nickname:
+          type: string
+        age:
+          type: integer
+        gender:
+          type: string
+        height:
+          type: number
+        weight:
+          type: number
+        taboo:
+          type: array
+          items:
+            type: string
+        disease:
+          type: array
+          items:
+            type: string
+      additionalProperties: true
+    ApprovalProposalItem:
+      type: object
+      properties:
+        field:
+          type: string
+        label:
+          type: string
+        value: {}
+      required: [field, label, value]
+    ToolTrace:
+      type: object
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          description: Usually values like `running`, `success`, `error`, `skipped`, or `proposed`.
+        result:
+          type: string
+      required: [name, status]
+    ApproveRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        approval_id:
+          type: string
+          minLength: 1
+        action:
+          type: string
+          enum: [approve, reject]
+      required: [approval_id, action]
+    ApproveApprovedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: approved
+        user_message:
+          type: string
+          enum: [approve]
+        approval_id:
+          type: string
+        result:
+          type: string
+        summary:
+          type: string
+        assistant_reply:
+          type: string
+        proposal:
+          $ref: '#/components/schemas/ApprovalProposalFields'
+        proposal_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalProposalItem'
+        tool:
+          type: object
+          properties:
+            name:
+              type: string
+              const: updateUserProfileTool
+            status:
+              type: string
+              const: success
+            result:
+              type: string
+          required: [name, status, result]
+      required:
+        - status
+        - user_message
+        - approval_id
+        - result
+        - assistant_reply
+        - proposal
+        - proposal_items
+        - tool
+    ApproveRejectedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: rejected
+        message:
+          type: string
+        user_message:
+          type: string
+          enum: [reject]
+        approval_id:
+          type: string
+        assistant_reply:
+          type: string
+        proposal:
+          $ref: '#/components/schemas/ApprovalProposalFields'
+        proposal_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalProposalItem'
+        tool:
+          type: object
+          properties:
+            name:
+              type: string
+              const: updateUserProfileTool
+            status:
+              type: string
+              const: skipped
+          required: [name, status]
+      required:
+        - status
+        - message
+        - user_message
+        - approval_id
+        - assistant_reply
+        - proposal
+        - proposal_items
+        - tool
+    ApproveNotFoundResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: not_found
+        message:
+          type: string
+      required: [status, message]
+    ApproveInvalidPayloadResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: invalid_payload
+        details:
+          $ref: '#/components/schemas/ValidationFlattenedDetails'
+      required: [status, details]
+    ApproveFailedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: failed
+        user_message:
+          type: string
+          enum: [approve]
+        approval_id:
+          type: string
+        message:
+          type: string
+          example: Failed to apply profile update.
+        assistant_reply:
+          type: string
+        tool:
+          type: object
+          properties:
+            name:
+              type: string
+              const: updateUserProfileTool
+            status:
+              type: string
+              const: error
+          required: [name, status]
+      required: [status, user_message, approval_id, message, assistant_reply, tool]
+    GenerateTitleRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        message:
+          type: string
+          minLength: 1
+      required: [message]
+    GenerateTitleResponse:
+      type: object
+      properties:
+        title:
+          type: string
+      required: [title]
+    GenerateTitleFallbackResponse:
+      type: object
+      properties:
+        title:
+          type: string
+          example: New conversation
+      required: [title]
+    KnowledgeDocumentRecord:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        source_type:
+          type: string
+        file_name:
+          type: string
+        file_ext:
+          type: string
+        mime_type:
+          type: string
+          nullable: true
+        file_size_bytes:
+          type: integer
+        file_hash:
+          type: string
+        storage_path:
+          type: string
+        uploaded_by:
+          type: string
+        uploader_role:
+          type: string
+          enum: [admin, nutritionist]
+        tags:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - title
+        - source_type
+        - file_name
+        - file_ext
+        - file_size_bytes
+        - file_hash
+        - storage_path
+        - uploaded_by
+        - uploader_role
+        - status
+        - created_at
+        - updated_at
+    KnowledgeUploadRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        file_name:
+          type: string
+          minLength: 1
+          maxLength: 180
+        file_base64:
+          type: string
+          minLength: 1
+          description: Raw base64 string or a full data URL.
+        mime_type:
+          type: string
+          maxLength: 120
+        title:
+          type: string
+          maxLength: 240
+        uploaded_by:
+          type: string
+          minLength: 1
+          maxLength: 120
+        uploader_role:
+          type: string
+          enum: [admin, nutritionist]
+        source_type:
+          type: string
+          maxLength: 80
+          default: manual_upload
+        tags:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            maxLength: 40
+          default: []
+      required:
+        - file_name
+        - file_base64
+        - uploaded_by
+        - uploader_role
+    KnowledgeUploadDuplicateResponse:
+      type: object
+      properties:
+        duplicate:
+          type: boolean
+          const: true
+        document:
+          type: object
+          properties:
+            id:
+              type: string
+            file_name:
+              type: string
+            status:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required: [id, file_name, status, created_at]
+      required: [duplicate, document]
+    KnowledgeUploadCreatedResponse:
+      type: object
+      properties:
+        duplicate:
+          type: boolean
+          const: false
+        document:
+          $ref: '#/components/schemas/KnowledgeDocumentRecord'
+      required: [duplicate, document]
+    KnowledgeIngestSuccessResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: success
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        extracted_char_count:
+          type: integer
+        parsed_md_path:
+          type: string
+        excerpt:
+          type: string
+      required:
+        - status
+        - job_id
+        - document_id
+        - extracted_char_count
+        - parsed_md_path
+        - excerpt
+    KnowledgeIngestFailedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: failed
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        error:
+          type: string
+      required: [status, job_id, document_id, error]
+    KnowledgeIngestionJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          description: Usually `processing`, `success`, or `failed`.
+        extractor:
+          type: string
+        parse_method:
+          type: string
+          nullable: true
+        parsed_md_path:
+          type: string
+          nullable: true
+        extracted_char_count:
+          type: integer
+          nullable: true
+        extracted_text_excerpt:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - document_id
+        - status
+        - extractor
+        - created_at
+        - updated_at
+    KnowledgeJobStatusResponse:
+      type: object
+      properties:
+        job:
+          $ref: '#/components/schemas/KnowledgeIngestionJob'
+      required: [job]
+    MohwSyncResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        total:
+          type: integer
+        newCount:
+          type: integer
+        updatedCount:
+          type: integer
+        generatedAt:
+          type: string
+          format: date-time
+      required: [ok, total, newCount, updatedCount, generatedAt]
+    MohwNewsListItem:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        publishedDate:
+          type: string
+          nullable: true
+      required: [id, title, publishedDate]
+    MohwNewsListResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        totalPages:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MohwNewsListItem'
+      required: [ok, page, pageSize, total, totalPages, items]
+    MohwNewsDetailResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        item:
+          type: object
+          properties:
+            id:
+              type: string
+            title:
+              type: string
+            publishedDate:
+              type: string
+              nullable: true
+            sourceUrl:
+              type: string
+              format: uri
+            content:
+              type: string
+              description: Full locally stored markdown content.
+          required: [id, title, publishedDate, sourceUrl, content]
+      required: [ok, item]
+    MohwNewsFilesResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        files:
+          type: array
+          items:
+            type: string
+      required: [ok, files]
+    NewsNotFoundError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: news_not_found
+      required: [ok, error]
+    NewsFileNotFoundError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: news_file_not_found
+      required: [ok, error]
+    KnowledgeSourceType:
+      type: string
+      enum: [nutrition_rules, mohw_news, uploaded_knowledge]
+    RagSearchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        query:
+          type: string
+          minLength: 1
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 12
+          default: 5
+        source_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeSourceType'
+        force_refresh:
+          type: boolean
+          default: false
+      required: [query]
+    RagSearchHit:
+      type: object
+      properties:
+        id:
+          type: string
+        source_type:
+          type: string
+        title:
+          type: string
+        source_path:
+          type: string
+        published_date:
+          type: string
+          nullable: true
+        score:
+          type: number
+        snippet:
+          type: string
+      required: [id, source_type, title, source_path, published_date, score, snippet]
+    RagSearchResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        query:
+          type: string
+        total_hits:
+          type: integer
+        hits:
+          type: array
+          items:
+            $ref: '#/components/schemas/RagSearchHit'
+      required: [ok, query, total_hits, hits]
+    AdminAuthRequiredError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: admin_auth_required
+      required: [ok, error]
+    RagUnavailableError:
+      type: object
+      properties:
+        error:
+          type: string
+          const: rag_documents_unavailable
+        message:
+          type: string
+      required: [error, message]
+    InvalidDocumentIdError:
+      type: object
+      properties:
+        error:
+          type: string
+          const: invalid_document_id
+        details:
+          $ref: '#/components/schemas/ValidationFlattenedDetails'
+      required: [error, details]
+    DocumentNotFoundError:
+      type: object
+      properties:
+        error:
+          type: string
+          const: document_not_found
+      required: [error]
+    RagDocumentItem:
+      type: object
+      properties:
+        id:
+          type: string
+        filename:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+        status:
+          type: string
+          description: Usually `uploaded`, `ingested`, or `failed`.
+        chunkCount:
+          type: integer
+          nullable: true
+        embeddingModel:
+          type: string
+          nullable: true
+        errorMessage:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        fileUrl:
+          type: string
+        previewUrl:
+          type: string
+      required:
+        - id
+        - filename
+        - mimeType
+        - sizeBytes
+        - status
+        - chunkCount
+        - embeddingModel
+        - errorMessage
+        - createdAt
+        - updatedAt
+        - fileUrl
+        - previewUrl
+    RagDocumentListResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RagDocumentItem'
+      required: [total, items]
+    RagDocumentDeleteResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        deleted:
+          type: boolean
+          const: true
+        documentId:
+          type: string
+      required: [ok, deleted, documentId]
+    RagDocumentPreviewResponse:
+      type: object
+      properties:
+        documentId:
+          type: string
+        filename:
+          type: string
+        mimeType:
+          type: string
+        previewKind:
+          type: string
+          enum: [text, unsupported]
+        content:
+          type: string
+        truncated:
+          type: boolean
+        fileUrl:
+          type: string
+        previewUrl:
+          type: string
+        message:
+          type: string
+          nullable: true
+      required:
+        - documentId
+        - filename
+        - mimeType
+        - previewKind
+        - content
+        - truncated
+        - fileUrl
+        - previewUrl
+        - message
+    GraphNodeType:
+      type: string
+      enum: [food, nutrient, condition, population, guideline, document, topic]
+    GraphRelationType:
+      type: string
+      enum: [contains, affects, recommended_for, not_recommended_for, supports, mentions]
+    GraphSourceType:
+      type: string
+      enum: [uploaded_knowledge, mohw_news, nutrition_rules]
+    GraphExtractRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        force:
+          type: boolean
+          default: false
+      required: []
+    GraphSummary:
+      type: object
+      properties:
+        document_count:
+          type: integer
+        node_count:
+          type: integer
+        edge_count:
+          type: integer
+        evidence_count:
+          type: integer
+        source_counts:
+          type: object
+          properties:
+            uploaded_knowledge:
+              type: integer
+            nutrition_rules:
+              type: integer
+            mohw_news:
+              type: integer
+          required: [uploaded_knowledge, nutrition_rules, mohw_news]
+        generated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - document_count
+        - node_count
+        - edge_count
+        - evidence_count
+        - source_counts
+        - generated_at
+    GraphExtractAllResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        force:
+          type: boolean
+        summary:
+          $ref: '#/components/schemas/GraphSummary'
+      required: [ok, force, summary]
+    GraphStatusResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        ready:
+          type: boolean
+        summary:
+          $ref: '#/components/schemas/GraphSummary'
+      required: [ok, ready, summary]
+    GraphNode:
+      type: object
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        node_type:
+          $ref: '#/components/schemas/GraphNodeType'
+        aliases:
+          type: array
+          items:
+            type: string
+        document_ids:
+          type: array
+          items:
+            type: string
+        source_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphSourceType'
+      required: [id, label, node_type, aliases, document_ids, source_types]
+    GraphEdge:
+      type: object
+      properties:
+        id:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+        relation_type:
+          $ref: '#/components/schemas/GraphRelationType'
+        confidence:
+          type: number
+        document_ids:
+          type: array
+          items:
+            type: string
+        evidence_ids:
+          type: array
+          items:
+            type: string
+      required:
+        - id
+        - source
+        - target
+        - relation_type
+        - confidence
+        - document_ids
+        - evidence_ids
+    GraphEvidence:
+      type: object
+      properties:
+        id:
+          type: string
+        edge_id:
+          type: string
+        document_id:
+          type: string
+        document_title:
+          type: string
+        source_type:
+          $ref: '#/components/schemas/GraphSourceType'
+        source_path:
+          type: string
+        snippet:
+          type: string
+      required:
+        - id
+        - edge_id
+        - document_id
+        - document_title
+        - source_type
+        - source_path
+        - snippet
+    GraphDocument:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        source_type:
+          $ref: '#/components/schemas/GraphSourceType'
+        source_path:
+          type: string
+        content_hash:
+          type: string
+        extracted_at:
+          type: string
+          format: date-time
+        node_ids:
+          type: array
+          items:
+            type: string
+        edge_ids:
+          type: array
+          items:
+            type: string
+        evidence_ids:
+          type: array
+          items:
+            type: string
+      required:
+        - id
+        - title
+        - source_type
+        - source_path
+        - content_hash
+        - extracted_at
+        - node_ids
+        - edge_ids
+        - evidence_ids
+    GraphDocumentExtractResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        cached:
+          type: boolean
+        document:
+          $ref: '#/components/schemas/GraphDocument'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEdge'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEvidence'
+      required: [ok, cached, document, nodes, edges, evidence]
+    GraphDocumentDetailResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        document:
+          $ref: '#/components/schemas/GraphDocument'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEdge'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEvidence'
+      required: [ok, document, nodes, edges, evidence]
+    GraphSearchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        query:
+          type: string
+          minLength: 1
+        max_nodes:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 12
+        source_types:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        document_ids:
+          type: array
+          items:
+            type: string
+            minLength: 1
+      required: [query]
+    GraphSearchResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        query:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEdge'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEvidence'
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphDocument'
+      required: [ok, query, nodes, edges, evidence, documents]
+    GraphNodeListResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+      required: [ok, total, items]
+    GraphNodeDetailResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        node:
+          $ref: '#/components/schemas/GraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEdge'
+        neighbors:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEvidence'
+      required: [ok, node, edges, neighbors, evidence]
+    GraphRelationEvidenceResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: true
+        relation:
+          $ref: '#/components/schemas/GraphEdge'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEvidence'
+      required: [ok, relation, evidence]
+    GraphDocumentNotFoundError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: document_not_found
+      required: [ok, error]
+    GraphDocumentCacheNotFoundError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: graph_document_not_found
+      required: [ok, error]
+    GraphNodeNotFoundError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: graph_node_not_found
+      required: [ok, error]
+    GraphRelationNotFoundError:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          const: graph_relation_not_found
+      required: [ok, error]

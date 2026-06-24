@@ -91,6 +91,44 @@ const normalizeUserContext = (rawContext: ChatRequestPayload['user_context']): s
     .filter((item) => item.length > 0);
 };
 
+const getPrimaryImagePayload = (payload: ChatRequestPayload): {
+  rawImage: unknown;
+  mimeTypeHint?: string;
+} => {
+  if (payload.image != null) {
+    return {
+      rawImage: payload.image,
+      mimeTypeHint: payload.image_mime_type || payload.imageMimeType,
+    };
+  }
+
+  const imageAttachment = payload.attachments.find((item) => {
+    const kind = typeof item.kind === 'string' ? item.kind.toLowerCase() : '';
+    const mimeType = typeof item.mime_type === 'string'
+      ? item.mime_type.toLowerCase()
+      : typeof item.mimeType === 'string'
+        ? item.mimeType.toLowerCase()
+        : '';
+    return kind === 'image' || mimeType.startsWith('image/');
+  });
+
+  if (!imageAttachment) {
+    return {
+      rawImage: undefined,
+      mimeTypeHint: payload.image_mime_type || payload.imageMimeType,
+    };
+  }
+
+  return {
+    rawImage: imageAttachment,
+    mimeTypeHint:
+      imageAttachment.mime_type ||
+      imageAttachment.mimeType ||
+      payload.image_mime_type ||
+      payload.imageMimeType,
+  };
+};
+
 const extractUrls = (text: string): string[] => {
   const matches = text.match(/https?:\/\/[^\s)]+/gi);
   if (!matches) return [];
@@ -173,6 +211,42 @@ const persistChatHistoryReply = async (input: {
   }
 };
 
+const insertInitialChatHistoryRow = async (input: {
+  threadId: string;
+  userId?: string;
+  userMessage: string;
+  imagePath?: string;
+  title?: string;
+}) => {
+  const result = await logDietTool.invoke({
+    room_id: input.threadId,
+    user_id: input.userId,
+    user_message: input.userMessage,
+    image_path: input.imagePath,
+    title: input.title,
+    ai_analysis_report: '__PENDING__',
+    record_type: 'chat',
+  });
+
+  if (typeof result === 'string' && result.startsWith('Failed')) {
+    throw new Error(result);
+  }
+
+  const insertedId =
+    result &&
+    typeof result === 'object' &&
+    'id' in (result as Record<string, unknown>) &&
+    typeof (result as Record<string, unknown>).id === 'string'
+      ? ((result as Record<string, unknown>).id as string)
+      : undefined;
+
+  if (!insertedId) {
+    throw new Error('Initial chat history insert did not return an id.');
+  }
+
+  return insertedId;
+};
+
 const persistChatRoomMetaWithClient = async (
   client: NonNullable<typeof supabase>,
   input: {
@@ -228,6 +302,65 @@ const persistChatRoomMeta = async (input: {
 
   await persistChatRoomMetaWithClient(supabase, input);
 };
+
+const createInitialChatPersistence = async ({
+  threadId,
+  userId,
+  userMessage,
+  imagePath,
+  isNewConversation,
+  persistChatRoomMetaFn = persistChatRoomMeta,
+  insertChatHistoryRowFn = insertInitialChatHistoryRow,
+}: {
+  threadId: string;
+  userId?: string;
+  userMessage: string;
+  imagePath?: string;
+  isNewConversation: boolean;
+  persistChatRoomMetaFn?: typeof persistChatRoomMeta;
+  insertChatHistoryRowFn?: (input: {
+    threadId: string;
+    userId?: string;
+    userMessage: string;
+    imagePath?: string;
+    title?: string;
+  }) => Promise<string | { status?: string; id?: string }>;
+}): Promise<{ chatHistoryId: string; provisionalTitle?: string }> => {
+  const provisionalTitle = isNewConversation
+    ? normalizeTitle('', userMessage)
+    : undefined;
+
+  await persistChatRoomMetaFn({
+    threadId,
+    userId,
+    title: provisionalTitle,
+  });
+
+  const insertResult = await insertChatHistoryRowFn({
+    threadId,
+    userId,
+    userMessage,
+    imagePath,
+    title: provisionalTitle,
+  });
+  const chatHistoryId =
+    typeof insertResult === 'string'
+      ? insertResult
+      : typeof insertResult?.id === 'string'
+        ? insertResult.id
+        : '';
+
+  if (!chatHistoryId) {
+    throw new Error('Initial chat history persistence did not resolve to a usable id.');
+  }
+
+  return {
+    chatHistoryId,
+    provisionalTitle,
+  };
+};
+
+export const createInitialChatPersistenceForTest = createInitialChatPersistence;
 
 export const shouldFallbackSummarizeTurn = (input: {
   userMessage: string;
@@ -470,10 +603,11 @@ export const chatHandler = async (req: Request, res: Response) => {
   }
 
   const payload: ChatRequestPayload = parsedBody.data;
+  const primaryImage = getPrimaryImagePayload(payload);
   console.log(
     `[REQ ${requestId}] /api/chat accepted payload thread_id=${payload.thread_id} chat_history_id=${payload.chat_history_id} user_id=${
       payload.user_id || 'guest'
-    } has_image=${Boolean(payload.image)} image_mime_type=${payload.image_mime_type || payload.imageMimeType || 'n/a'}`
+    } has_image=${Boolean(primaryImage.rawImage)} attachment_count=${payload.attachments.length} image_mime_type=${primaryImage.mimeTypeHint || 'n/a'}`
   );
 
   const normalizedUserId = payload.user_id && payload.user_id.length > 0
@@ -485,10 +619,10 @@ export const chatHandler = async (req: Request, res: Response) => {
 
   try {
     const maybeImagePath = saveIncomingImageToWorkspace({
-      rawImage: payload.image,
+      rawImage: primaryImage.rawImage,
       userId: normalizedUserId,
       threadId: payload.thread_id,
-      mimeTypeHint: payload.image_mime_type || payload.imageMimeType,
+      mimeTypeHint: primaryImage.mimeTypeHint,
     });
     if (maybeImagePath) {
       savedImagePath = maybeImagePath;
@@ -523,6 +657,10 @@ export const chatHandler = async (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
 
   const config = { configurable: { thread_id: payload.thread_id } };
 
@@ -572,6 +710,15 @@ export const chatHandler = async (req: Request, res: Response) => {
       formatRoomSummaryIndexContext(roomSummaryEntries),
       `Current room summary: ${summarizeRoomSummaryIndex(roomSummaryEntries) || 'None.'}`,
     ].join('\n\n');
+
+    const initialPersistence = await createInitialChatPersistence({
+      threadId: payload.thread_id,
+      userId: normalizedUserId,
+      userMessage: effectiveUserMessage,
+      imagePath: savedImagePath,
+      isNewConversation: payload.is_new_conversation,
+    });
+    const chatHistoryId = initialPersistence.chatHistoryId;
 
     const streamResult = await withTimeout(
       runAgentStream(res, config, {
@@ -675,10 +822,10 @@ export const chatHandler = async (req: Request, res: Response) => {
     void (async () => {
       try {
         console.log(
-          `[REQ ${requestId}] persistence start chat_history_id=${payload.chat_history_id} room_id=${payload.thread_id}`
+          `[REQ ${requestId}] persistence start chat_history_id=${chatHistoryId} room_id=${payload.thread_id}`
         );
         await persistChatHistoryReply({
-          chatHistoryId: payload.chat_history_id,
+          chatHistoryId,
           aiReply: finalVisibleText,
         });
 
@@ -688,7 +835,7 @@ export const chatHandler = async (req: Request, res: Response) => {
 
         await persistSummaryOutputs({
           threadId: payload.thread_id,
-          chatHistoryId: payload.chat_history_id,
+          chatHistoryId,
           userId: normalizedUserId,
           title,
           summaryProposals,
@@ -703,7 +850,7 @@ export const chatHandler = async (req: Request, res: Response) => {
           assistantReplyForFallback: finalVisibleText,
         });
         console.log(
-          `[REQ ${requestId}] persistence success chat_history_id=${payload.chat_history_id} room_id=${payload.thread_id}`
+          `[REQ ${requestId}] persistence success chat_history_id=${chatHistoryId} room_id=${payload.thread_id}`
         );
       } catch (persistError) {
         console.error(`[REQ ${requestId}] Background persistence failed:`, persistError);
