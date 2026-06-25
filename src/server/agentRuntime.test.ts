@@ -347,7 +347,7 @@ describe('stream chunk accumulation', () => {
       'event: text\ndata: {"type":"text","content":"hi"}\n\n'
     );
     expect(formatSSEMessage({ type: 'status', content: 'thinking' })).toBe(
-      'data: {"type":"status","content":"thinking"}\n\n'
+      'event: status\ndata: {"type":"status","content":"thinking"}\n\n'
     );
   });
 
