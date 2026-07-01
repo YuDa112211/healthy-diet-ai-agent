@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import type { Response } from 'express';
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
@@ -15,8 +16,8 @@ import {
   summarizeConversationTurnTool,
   type ConversationSummaryToolResult,
 } from '../../agent_skills/conversation_summary_tool';
+import { loadDefaultAgentConfig, type AgentConfig } from '../config/agentConfig';
 import { checkWebPageTool, fetchWebPageTool } from '../../agent_skills/fetch_web';
-import { AGENT_FILE, INDEX_FILE, LEGACY_INDEX_FILE, RULES_FILE } from './workspacePaths';
 import { toStatusText } from './httpRuntime';
 import type { ChatModelSource } from './chatPayload';
 import { formatSSEMessage, sendSSE as writeSSE } from './sse';
@@ -196,14 +197,98 @@ export const sanitizeAssistantStreamingText = (message: string): string => {
   return output;
 };
 
-const RESPONSE_FORMAT_INSTRUCTIONS = [
-  'Match this response format exactly:',
-  '- Use short paragraphs in Traditional Chinese.',
-  '- When listing concrete advice, use numbered lists.',
-  '- Keep headings minimal; only add one short heading when it helps.',
-  '- Do not output markdown tables or raw JSON.',
-  '- End cleanly without meta commentary about formatting or model choice.',
-].join('\n');
+const getLanguageInstruction = (language: AgentConfig['responseStyle']['language']): string => {
+  if (language === 'zh-TW') {
+    return 'Use Traditional Chinese.';
+  }
+
+  return `Use ${language}.`;
+};
+
+const getParagraphStyleInstruction = (
+  paragraphStyle: AgentConfig['responseStyle']['paragraphStyle']
+): string => {
+  if (paragraphStyle === 'short') {
+    return 'Use short paragraphs.';
+  }
+
+  if (paragraphStyle === 'medium') {
+    return 'Use medium-length paragraphs.';
+  }
+
+  return 'Use longer paragraphs when needed.';
+};
+
+const getToolJsonInstruction = (language: AgentConfig['responseStyle']['language']): string => {
+  if (language === 'zh-TW') {
+    return 'If tool outputs JSON, convert it into concise Traditional Chinese explanation.';
+  }
+
+  return `If tool outputs JSON, convert it into concise explanation in ${language}.`;
+};
+
+export const buildResponseFormatInstructions = (
+  responseStyle: AgentConfig['responseStyle']
+): string => {
+  const lines = [
+    'Match this response format exactly:',
+    `- ${getLanguageInstruction(responseStyle.language)}`,
+    `- ${getParagraphStyleInstruction(responseStyle.paragraphStyle)}`,
+    responseStyle.useNumberedListsForAdvice
+      ? '- When listing concrete advice, use numbered lists.'
+      : '- When listing concrete advice, prefer plain paragraphs or simple bullets.',
+    '- Keep headings minimal; only add one short heading when it helps.',
+    responseStyle.allowMarkdownTables
+      ? '- Markdown tables are allowed only when they make the answer clearer.'
+      : '- Do not output markdown tables.',
+    responseStyle.allowRawJson
+      ? '- Raw JSON is allowed only when the user explicitly asks for it.'
+      : '- Do not output raw JSON.',
+    `- ${getToolJsonInstruction(responseStyle.language)}`,
+    '- End cleanly without meta commentary about formatting or model choice.',
+  ];
+
+  return lines.join('\n');
+};
+
+export const buildResponseStylePromptSection = (
+  responseStyle: AgentConfig['responseStyle']
+): string[] => ['--- Response Style ---', buildResponseFormatInstructions(responseStyle)];
+
+export const buildCallModelResponseStylePromptLines = (
+  responseStyle: AgentConfig['responseStyle']
+): string[] => buildResponseStylePromptSection(responseStyle);
+
+const getCompatibleSkillsIndexCandidates = (skillsIndexFile: string): string[] => {
+  const directory = path.dirname(skillsIndexFile);
+  const baseName = path.basename(skillsIndexFile);
+
+  const candidates = [skillsIndexFile];
+  if (baseName === 'SKILL_INDEX.md') {
+    candidates.push(path.join(directory, 'SKILLS_INDEX.md'));
+  } else if (baseName === 'SKILLS_INDEX.md') {
+    candidates.push(path.join(directory, 'SKILL_INDEX.md'));
+  }
+
+  return Array.from(new Set(candidates));
+};
+
+export const resolveAgentRuntimePromptPaths = (
+  config: Pick<AgentConfig, 'agent'>
+): {
+  systemPromptFile: string;
+  skillsIndexCandidates: string[];
+  rulesFile: string;
+} => ({
+  systemPromptFile: config.agent.systemPromptFile,
+  skillsIndexCandidates: getCompatibleSkillsIndexCandidates(config.agent.skillsIndexFile),
+  rulesFile: config.agent.rulesFile,
+});
+
+export const loadAgentRuntimeSkillsIndexText = (config: Pick<AgentConfig, 'agent'>): string => {
+  const promptPaths = resolveAgentRuntimePromptPaths(config);
+  return readOptionalFile(...promptPaths.skillsIndexCandidates);
+};
 
 const hasAnalyzeFoodToolResult = (messages: unknown[] | undefined): boolean => {
   if (!Array.isArray(messages)) return false;
@@ -387,7 +472,8 @@ const proposeProfileUpdateTool = tool(
 
 const listCapabilitiesTool = tool(
   async () => {
-    const skillsIndex = readOptionalFile(INDEX_FILE, LEGACY_INDEX_FILE);
+    const agentConfig = await loadDefaultAgentConfig();
+    const skillsIndex = loadAgentRuntimeSkillsIndexText(agentConfig);
 
     return buildCapabilitiesSummary({
       toolNames: REGISTERED_CAPABILITY_TOOL_NAMES,
@@ -542,9 +628,11 @@ const AgentState = Annotation.Root({
 });
 
 const callModel = async (state: typeof AgentState.State) => {
-  const agentInstructions = fs.existsSync(AGENT_FILE) ? fs.readFileSync(AGENT_FILE, 'utf-8') : '';
-  const skillsIndex = readOptionalFile(INDEX_FILE, LEGACY_INDEX_FILE);
-  const nutritionRules = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf-8') : '';
+  const agentConfig = await loadDefaultAgentConfig();
+  const promptPaths = resolveAgentRuntimePromptPaths(agentConfig);
+  const agentInstructions = readOptionalFile(promptPaths.systemPromptFile);
+  const skillsIndex = loadAgentRuntimeSkillsIndexText(agentConfig);
+  const nutritionRules = readOptionalFile(promptPaths.rulesFile);
 
   const userInfo = state.user_id
     ? `Current user id: ${state.user_id}`
@@ -586,10 +674,7 @@ const callModel = async (state: typeof AgentState.State) => {
         ].join('\n')
       : 'No image attached in this request.',
     '',
-    '--- Response Style ---',
-    RESPONSE_FORMAT_INSTRUCTIONS,
-    'Never output raw JSON directly to the user.',
-    'If tool outputs JSON, convert it into concise Traditional Chinese explanation.',
+    ...buildCallModelResponseStylePromptLines(agentConfig.responseStyle),
     'If the user asks what you can do, what features you have, or what capabilities are available, call list_capabilities_tool first and answer strictly from that result.',
     'When describing your capabilities, do not claim any feature that is not present in list_capabilities_tool output or explicit runtime instructions.',
     'For factual health/nutrition/food-safety claims, call search_knowledge_tool first, then answer with cited source_path values.',

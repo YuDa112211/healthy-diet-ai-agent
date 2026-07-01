@@ -110,11 +110,21 @@ Google routing variables:
 - `GOOGLE_CHAT_MODEL`
 - `GOOGLE_BASE_URL`
 
+Project-level agent behavior now lives in:
+
+- `agent_config.json`
+
 Background sync variables:
 
 - `MOHW_NEWS_SYNC_ENABLED`
 - `MOHW_NEWS_SYNC_INTERVAL_MINUTES`
 - `MOHW_NEWS_SYNC_RUN_ON_START`
+
+Config precedence:
+
+- `agent_config.json` provides the repository default behavior
+- environment variables override those defaults for a specific deployment
+- `MOHW_NEWS_SYNC_ENABLED` overrides `agent_config.json` `features.mohw_enabled` when explicitly set
 
 ## Standalone Local Usage
 
@@ -211,6 +221,31 @@ Notes:
 - storage writes are routed through the shared storage layer
 - this mode is intended for existing stacks that already use Supabase tables for chat and knowledge metadata
 
+## Repurpose This Repo Into Another Advisor
+
+Fork authors can now customize the agent without editing core runtime code for the common role and retrieval cases.
+
+Start here:
+
+1. Edit `agent_config.json`
+2. Replace `knowledge_base/AGENT.md`
+3. Replace or remove `knowledge_base/NUTRITION_RULES.md`
+4. Enable or disable `mohw_news` in `agent_config.json`
+5. Add your own uploaded or curated knowledge files
+
+What `agent_config.json` controls:
+
+- agent prompt file locations
+- response style defaults
+- RAG enabled sources
+- RAG search tuning
+- MOHW default enablement
+
+Practical note:
+
+- use `agent_config.json` for repo-level defaults
+- use `.env` only for deployment-specific overrides
+
 ## API Overview
 
 ### Chat
@@ -287,6 +322,9 @@ bun test
 - Supabase mode remains supported for integration scenarios
 - standalone mode does not require `health-diet-api`
 - the app still expects a working model endpoint through `AI_API_URL` or the configured Google route
+- RAG document admin routes now require forwarded admin headers: `X-Admin-User-Id` and `X-Admin-Role` (`admin` or `nutritionist`)
+- A bare `Authorization` header is no longer treated as admin access for document management routes
+- When `/api/chat` fails after creating the initial history row, the placeholder reply is rewritten from `__PENDING__` to a `[FAILED] ...` marker
 
 ## Related Docs
 

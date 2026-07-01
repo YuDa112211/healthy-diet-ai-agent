@@ -190,6 +190,32 @@ SUPABASE_SERVICE_KEY=your-service-role-key
 - 真正的 storage 寫入已統一經過 shared storage layer
 - 適合接回既有 `health-diet-api` 或其他 Supabase 架構
 
+## Fork 後改造成其他顧問
+
+現在常見的角色與檢索客製化，可以先不改核心 runtime 程式碼。
+
+建議修改順序：
+
+1. 編輯 `agent_config.json`
+2. 替換 `knowledge_base/AGENT.md`
+3. 替換或移除 `knowledge_base/NUTRITION_RULES.md`
+4. 在 `agent_config.json` 開啟或關閉 `mohw_news`
+5. 加入你自己的知識文件
+
+`agent_config.json` 目前可控制：
+
+- agent prompt 檔案位置
+- 回覆風格預設值
+- RAG 啟用來源
+- RAG 搜尋參數
+- MOHW 預設是否啟用
+
+設定優先序：
+
+- `agent_config.json` 是專案預設值
+- `.env` 是部署時覆蓋值
+- `MOHW_NEWS_SYNC_ENABLED` 會在有設定時覆蓋 `agent_config.json` 的 `features.mohw_enabled`
+
 ## API 概覽
 
 ### Chat
@@ -273,3 +299,8 @@ bun test
 - Japanese README：`README_jp.md`
 - Agent 維護規則：`AGENT.md`
 - Codex 變更紀錄：`CHANGELOG_CODEX.md`
+## Security And Failure Notes
+
+- RAG 文件管理 API 現在必須帶 `X-Admin-User-Id` 與 `X-Admin-Role`（`admin` 或 `nutritionist`）
+- 只有 `Authorization` header 已不再視為管理員權限
+- 如果 `/api/chat` 在建立初始聊天紀錄後失敗，原本的 `__PENDING__` 會改寫成 `[FAILED] ...`

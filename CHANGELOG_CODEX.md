@@ -1,5 +1,33 @@
 # CHANGELOG_CODEX
 
+## 2026-07-01 12:55 Asia/Taipei
+
+- Summary: Hardened RAG admin route authentication and prevent failed chat turns from leaving `__PENDING__` rows behind.
+- Author: Codex
+- Scope:
+  - RAG admin auth
+  - chat failure persistence
+  - repository documentation
+- Files:
+  - `src/server/ragDocuments.ts`
+  - `src/server/ragDocuments.test.ts`
+  - `src/serverHandlers.ts`
+  - `src/server/serverHandlers.test.ts`
+  - `README.md`
+  - `README_zh.md`
+  - `CHANGELOG_CODEX.md`
+- API:
+  - Added: `none`
+  - Changed: `RAG document admin routes now require forwarded admin identity headers`
+  - Removed: `none`
+- Env:
+  - Added: `none`
+  - Changed: `none`
+  - Removed: `none`
+- Notes:
+  - `/api/chat` now rewrites failed placeholder replies from `__PENDING__` to `[FAILED] ...` when the model run errors after persistence starts.
+  - Bare `Authorization` headers no longer grant admin access to RAG document routes.
+
 ## 2026-06-22 22:10 Asia/Taipei
 
 - Summary: Reworked conversation memory so `chat_rooms.summary` stores a traceable summary index before falling back to raw `diet_chat_history` turns.
@@ -132,3 +160,36 @@
 - Notes:
   - Documented the original relationship with `PU-Hub/healthy-diet` and `healthy-diet-web`.
   - Clarified why this repository is now being presented as an independent deployable project.
+
+## 2026-07-01 15:40 Asia/Taipei
+
+- Summary: Added `agent_config.json` driven role, prompt, RAG, and MOHW defaults so forks can repurpose the project into other advisor agents with less code editing.
+- Author: Codex
+- Scope:
+  - config
+  - runtime
+  - rag
+  - docs
+- Files:
+  - `agent_config.json`
+  - `src/config/agentConfig.ts`
+  - `src/server/agentRuntime.ts`
+  - `agent_skills/file_tools.ts`
+  - `src/server/ragSearch.ts`
+  - `src/server/mohwConfig.ts`
+  - `README.md`
+  - `README_zh.md`
+  - `README_jp.md`
+  - `.env.example`
+- API:
+  - Added: `none`
+  - Changed: `runtime configuration and RAG search behavior`
+  - Removed: `none`
+- Env:
+  - Added: `none`
+  - Changed: `MOHW_NEWS_SYNC_ENABLED`
+  - Removed: `none`
+- Notes:
+  - Prompt file locations now resolve from `agent_config.json`.
+  - RAG enabled sources and search tuning now resolve from `agent_config.json`.
+  - `MOHW_NEWS_SYNC_ENABLED` now overrides the repo default from `agent_config.json` when explicitly set.

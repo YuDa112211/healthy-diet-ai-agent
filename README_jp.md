@@ -264,6 +264,32 @@ bun test
 
 - 自己ホスト用途では SQLite standalone モードを推奨
 - 既存システム統合時は Supabase モードへ切り替え
+
+## Fork 後に別のアドバイザーへ転用する
+
+現在は、よくある役割変更や検索設定の変更なら、core runtime を直接編集しなくても進めやすくなっています。
+
+おすすめの順番:
+
+1. `agent_config.json` を編集する
+2. `knowledge_base/AGENT.md` を差し替える
+3. `knowledge_base/NUTRITION_RULES.md` を差し替える、または削除する
+4. `agent_config.json` で `mohw_news` を有効化または無効化する
+5. 独自の知識ドキュメントを追加する
+
+`agent_config.json` で管理できる内容:
+
+- agent prompt ファイルの場所
+- 応答スタイルの既定値
+- RAG の有効ソース
+- RAG 検索チューニング
+- MOHW の既定有効状態
+
+優先順位:
+
+- `agent_config.json` はリポジトリ既定値
+- `.env` はデプロイ時の上書き値
+- `MOHW_NEWS_SYNC_ENABLED` が設定されている場合は `agent_config.json` の `features.mohw_enabled` より優先されます
 - standalone mode では `health-diet-api` は不要
 - どのモードでも、`AI_API_URL` などの有効なモデル接続先は必要
 

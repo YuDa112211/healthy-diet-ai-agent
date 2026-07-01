@@ -193,6 +193,25 @@ const persistChatHistoryReply = async (input: {
   await storage.updateChatHistoryReply(input);
 };
 
+const formatFailedChatReply = (reason: string): string => {
+  const normalizedReason = reason.trim() || 'Failed to process chat.';
+  return `[FAILED] ${normalizedReason}`;
+};
+
+const persistFailedChatReply = async (input: {
+  chatHistoryId: string;
+  reason: string;
+  storage?: Pick<AppStorage, 'updateChatHistoryReply'>;
+}): Promise<void> => {
+  const storage = input.storage ?? await getStorage();
+  await storage.updateChatHistoryReply({
+    chatHistoryId: input.chatHistoryId,
+    aiReply: formatFailedChatReply(input.reason),
+  });
+};
+
+export const persistFailedChatReplyForTest = persistFailedChatReply;
+
 const insertInitialChatHistoryRow = async (input: {
   threadId: string;
   userId?: string;
@@ -649,6 +668,7 @@ export const chatHandler = async (req: Request, res: Response) => {
   }
 
   const config = { configurable: { thread_id: payload.thread_id } };
+  let chatHistoryId = '';
 
   try {
     console.log(`[REQ ${requestId}] /api/chat agent start`);
@@ -704,7 +724,7 @@ export const chatHandler = async (req: Request, res: Response) => {
       imagePath: savedImagePath,
       isNewConversation: payload.is_new_conversation,
     });
-    const chatHistoryId = initialPersistence.chatHistoryId;
+    chatHistoryId = initialPersistence.chatHistoryId;
 
     const streamResult = await withTimeout(
       runAgentStream(res, config, {
@@ -845,6 +865,11 @@ export const chatHandler = async (req: Request, res: Response) => {
   } catch (error) {
     const timeoutHit = isTimeoutError(error);
     const upstreamConnectionError = isUpstreamConnectionError(error);
+    const failureMessage = timeoutHit
+      ? 'AI processing timed out. Please try again.'
+      : upstreamConnectionError
+        ? 'AI service is temporarily unreachable. Please check AI_API_URL or Rust server status.'
+        : 'Failed to process chat.';
     if (timeoutHit) {
       console.error(`[REQ ${requestId}] /api/chat timeout:`, error);
     }
@@ -852,15 +877,21 @@ export const chatHandler = async (req: Request, res: Response) => {
       console.error(`[REQ ${requestId}] /api/chat upstream connection error AI_API_URL=${AI_API_URL}`);
     }
     console.error(`[REQ ${requestId}] Agent Error:`, error);
+    if (chatHistoryId) {
+      try {
+        await persistFailedChatReply({
+          chatHistoryId,
+          reason: failureMessage,
+        });
+      } catch (persistError) {
+        console.error(
+          `[REQ ${requestId}] Failed to mark chat_history_id=${chatHistoryId} as failed:`,
+          persistError
+        );
+      }
+    }
     if (!res.writableEnded) {
-      sendSSE(
-        res,
-        timeoutHit
-          ? { type: 'error', content: 'AI processing timed out. Please try again.' }
-          : upstreamConnectionError
-            ? { type: 'error', content: 'AI service is temporarily unreachable. Please check AI_API_URL or Rust server status.' }
-            : { type: 'error', content: 'Failed to process chat.' }
-      );
+      sendSSE(res, { type: 'error', content: failureMessage });
       res.end();
     }
   }

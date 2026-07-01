@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   createInitialChatPersistenceForTest,
   formatRoomSummaryIndexContextForTest,
+  persistFailedChatReplyForTest,
   persistChatRoomMetaWithClientForTest,
   persistSummaryOutputsForTest,
   shouldFallbackSummarizeTurn,
@@ -89,11 +90,12 @@ describe('createInitialChatPersistenceForTest', () => {
   test('upserts chat room and inserts an initial chat row before streaming begins', async () => {
     const roomWrites: Array<Record<string, unknown>> = [];
     const historyWrites: Array<Record<string, unknown>> = [];
+    const userMessage = '今天早餐吃了燕麥和水煮蛋';
 
     const result = await createInitialChatPersistenceForTest({
       threadId: 'room-1',
       userId: '00000000-0000-0000-0000-000000000001',
-      userMessage: '午餐照片幫我分析一下',
+      userMessage,
       imagePath: 'images/room-1/lunch.png',
       isNewConversation: true,
       persistChatRoomMetaFn: async (input) => {
@@ -107,16 +109,39 @@ describe('createInitialChatPersistenceForTest', () => {
 
     expect(result).toEqual({
       chatHistoryId: 'chat-row-1',
-      provisionalTitle: '午餐照片幫我分析一下',
+      provisionalTitle: userMessage,
     });
     expect(roomWrites).toHaveLength(1);
     expect(roomWrites[0]?.threadId).toBe('room-1');
     expect(roomWrites[0]?.userId).toBe('00000000-0000-0000-0000-000000000001');
-    expect(roomWrites[0]?.title).toBe('午餐照片幫我分析一下');
+    expect(roomWrites[0]?.title).toBe(userMessage);
     expect(historyWrites).toHaveLength(1);
     expect(historyWrites[0]?.threadId).toBe('room-1');
     expect(historyWrites[0]?.imagePath).toBe('images/room-1/lunch.png');
-    expect(historyWrites[0]?.title).toBe('午餐照片幫我分析一下');
+    expect(historyWrites[0]?.title).toBe(userMessage);
+  });
+});
+
+describe('persistFailedChatReplyForTest', () => {
+  test('replaces pending chat reply with a failure marker when streaming fails', async () => {
+    const writes: Array<{ chatHistoryId: string; aiReply: string }> = [];
+
+    await persistFailedChatReplyForTest({
+      chatHistoryId: 'chat-row-failed',
+      reason: 'AI processing timed out. Please try again.',
+      storage: {
+        updateChatHistoryReply: async (input) => {
+          writes.push(input);
+        },
+      } as never,
+    });
+
+    expect(writes).toEqual([
+      {
+        chatHistoryId: 'chat-row-failed',
+        aiReply: '[FAILED] AI processing timed out. Please try again.',
+      },
+    ]);
   });
 });
 
@@ -203,8 +228,8 @@ describe('shouldFallbackSummarizeTurn', () => {
   test('returns true for non-empty exchanges so the model can decide', () => {
     expect(
       shouldFallbackSummarizeTurn({
-        userMessage: '可以分析我的身體狀況後給我一份今天的專屬食譜嗎',
-        assistantReply: '這是一段有內容的回答。',
+        userMessage: '我昨天晚餐吃了便當，今天想控制熱量。',
+        assistantReply: '可以，先從總熱量與蛋白質分配開始調整。',
       })
     ).toBe(true);
   });
@@ -224,7 +249,7 @@ describe('formatRoomSummaryIndexContextForTest', () => {
     const output = formatRoomSummaryIndexContextForTest([
       {
         summary_id: 'sum-1',
-        summary: '6/20 討論 168 斷食與當日飲食。',
+        summary: '6/20 體重 68 公斤，早餐改成高蛋白搭配燕麥。',
         source_chat_history_ids: ['chat-1'],
         source_summary_history_id: 'summary-row-1',
         created_at: '2026-06-20T08:30:00.000Z',
@@ -233,7 +258,7 @@ describe('formatRoomSummaryIndexContextForTest', () => {
       },
       {
         summary_id: 'sum-2',
-        summary: '6/21 分享弟弟一天的飲食。',
+        summary: '6/21 晚餐以清淡飲食為主，減少含糖飲料。',
         source_chat_history_ids: ['chat-5'],
         source_summary_history_id: 'summary-row-2',
         created_at: '2026-06-21T12:00:00.000Z',

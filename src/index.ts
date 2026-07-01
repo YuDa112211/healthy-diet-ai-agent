@@ -30,11 +30,12 @@ import {
   urlencodedBodyParser,
 } from './serverHandlers';
 import { formatStartupBanner, resolveStorageBackend } from './server/httpRuntime';
+import { loadDefaultAgentConfig } from './config/agentConfig';
+import { resolveMohwNewsSyncEnabled } from './server/mohwConfig';
 import { getStorage } from './storage/runtime';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8001;
-const MOHW_NEWS_SYNC_ENABLED = String(process.env.MOHW_NEWS_SYNC_ENABLED || 'false').toLowerCase() === 'true';
 const MOHW_NEWS_SYNC_RUN_ON_START =
   String(process.env.MOHW_NEWS_SYNC_RUN_ON_START || 'false').toLowerCase() === 'true';
 const MOHW_NEWS_SYNC_INTERVAL_MINUTES = Math.max(
@@ -86,6 +87,8 @@ const runMohwSyncSafely = async (trigger: 'startup' | 'interval'): Promise<void>
 };
 
 const startServer = async () => {
+  const agentConfig = await loadDefaultAgentConfig();
+  const MOHW_NEWS_SYNC_ENABLED = resolveMohwNewsSyncEnabled(agentConfig.features.mohwEnabled);
   const storage = await getStorage();
   await storage.ensureReady();
 

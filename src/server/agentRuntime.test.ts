@@ -1,4 +1,8 @@
-import { beforeAll, describe, expect, test } from 'bun:test';
+import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { loadDefaultAgentConfig } from '../config/agentConfig';
 import type { ChatProvider } from './modelRouting';
 
 const getRequiredFunction = <T extends (...args: any[]) => any>(
@@ -19,10 +23,23 @@ const loadAgentRuntime = async () => {
 };
 
 let agentRuntimeModule: Awaited<ReturnType<typeof loadAgentRuntime>>;
+const tempDirs: string[] = [];
 
 beforeAll(async () => {
   agentRuntimeModule = await loadAgentRuntime();
 });
+
+afterEach(async () => {
+  await Promise.all(
+    tempDirs.splice(0).map((tempDir) => rm(tempDir, { recursive: true, force: true })),
+  );
+});
+
+const createTempDir = async (): Promise<string> => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'agent-runtime-skills-index-'));
+  tempDirs.push(tempDir);
+  return tempDir;
+};
 
 describe('buildAgentModelAttemptPlan', () => {
   test('returns local-only attempt plan for local model source', async () => {
@@ -56,6 +73,299 @@ describe('buildAgentModelAttemptPlan', () => {
       { provider: 'local', reason: 'selected' },
     ]);
     expect(buildAgentModelAttemptPlan('google', false)).toEqual([]);
+  });
+});
+
+describe('resolveAgentRuntimePromptPaths', () => {
+  test('uses resolved config prompt paths and keeps compatible skills-index candidates', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const resolveAgentRuntimePromptPaths = getRequiredFunction<
+      (config: {
+        agent: {
+          systemPromptFile: string;
+          skillsIndexFile: string;
+          rulesFile: string;
+        };
+      }) => {
+        systemPromptFile: string;
+        skillsIndexCandidates: string[];
+        rulesFile: string;
+      }
+    >(
+      (agentRuntime as Record<string, unknown>).resolveAgentRuntimePromptPaths,
+      'resolveAgentRuntimePromptPaths'
+    );
+
+    const config = await loadDefaultAgentConfig();
+    const promptPaths = resolveAgentRuntimePromptPaths(config);
+
+    expect(promptPaths.systemPromptFile).toBe(config.agent.systemPromptFile);
+    expect(promptPaths.rulesFile).toBe(config.agent.rulesFile);
+    expect(promptPaths.skillsIndexCandidates[0]).toBe(config.agent.skillsIndexFile);
+    expect(promptPaths.skillsIndexCandidates).toContain(
+      path.join(path.dirname(config.agent.skillsIndexFile), 'SKILLS_INDEX.md')
+    );
+  });
+});
+
+describe('loadAgentRuntimeSkillsIndexText', () => {
+  test('loads skills-index text through config-driven compatible prompt paths', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const loadAgentRuntimeSkillsIndexText = getRequiredFunction<
+      (config: {
+        agent: {
+          systemPromptFile: string;
+          skillsIndexFile: string;
+          rulesFile: string;
+        };
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).loadAgentRuntimeSkillsIndexText,
+      'loadAgentRuntimeSkillsIndexText'
+    );
+
+    const config = await loadDefaultAgentConfig();
+    const skillsIndexText = loadAgentRuntimeSkillsIndexText(config);
+
+    expect(skillsIndexText.length).toBeGreaterThan(0);
+    expect(skillsIndexText).toContain('`');
+  });
+
+  test('falls back from missing SKILL_INDEX.md to existing SKILLS_INDEX.md', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const loadAgentRuntimeSkillsIndexText = getRequiredFunction<
+      (config: {
+        agent: {
+          systemPromptFile: string;
+          skillsIndexFile: string;
+          rulesFile: string;
+        };
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).loadAgentRuntimeSkillsIndexText,
+      'loadAgentRuntimeSkillsIndexText'
+    );
+
+    const tempDir = await createTempDir();
+    const legacyPath = path.join(tempDir, 'SKILL_INDEX.md');
+    const pluralPath = path.join(tempDir, 'SKILLS_INDEX.md');
+    await writeFile(pluralPath, '# Skills\n- `fallback_tool`: from plural file\n');
+
+    const skillsIndexText = loadAgentRuntimeSkillsIndexText({
+      agent: {
+        systemPromptFile: path.join(tempDir, 'AGENT.md'),
+        skillsIndexFile: legacyPath,
+        rulesFile: path.join(tempDir, 'NUTRITION_RULES.md'),
+      },
+    });
+
+    expect(skillsIndexText).toContain('fallback_tool');
+    expect(skillsIndexText).toContain('plural file');
+  });
+
+  test('falls back from missing SKILLS_INDEX.md to existing SKILL_INDEX.md', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const loadAgentRuntimeSkillsIndexText = getRequiredFunction<
+      (config: {
+        agent: {
+          systemPromptFile: string;
+          skillsIndexFile: string;
+          rulesFile: string;
+        };
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).loadAgentRuntimeSkillsIndexText,
+      'loadAgentRuntimeSkillsIndexText'
+    );
+
+    const tempDir = await createTempDir();
+    const legacyPath = path.join(tempDir, 'SKILL_INDEX.md');
+    const pluralPath = path.join(tempDir, 'SKILLS_INDEX.md');
+    await writeFile(legacyPath, '# Skills\n- `fallback_tool`: from singular file\n');
+
+    const skillsIndexText = loadAgentRuntimeSkillsIndexText({
+      agent: {
+        systemPromptFile: path.join(tempDir, 'AGENT.md'),
+        skillsIndexFile: pluralPath,
+        rulesFile: path.join(tempDir, 'NUTRITION_RULES.md'),
+      },
+    });
+
+    expect(skillsIndexText).toContain('fallback_tool');
+    expect(skillsIndexText).toContain('singular file');
+  });
+});
+
+describe('buildResponseFormatInstructions', () => {
+  test('derives current default response guidance from resolved config responseStyle', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const buildResponseFormatInstructions = getRequiredFunction<
+      (responseStyle: {
+        language: string;
+        paragraphStyle: 'short' | 'medium' | 'long';
+        useNumberedListsForAdvice: boolean;
+        allowMarkdownTables: boolean;
+        allowRawJson: boolean;
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).buildResponseFormatInstructions,
+      'buildResponseFormatInstructions'
+    );
+
+    const instructions = buildResponseFormatInstructions({
+      language: 'zh-TW',
+      paragraphStyle: 'short',
+      useNumberedListsForAdvice: true,
+      allowMarkdownTables: false,
+      allowRawJson: false,
+    });
+
+    expect(instructions).toContain('Traditional Chinese');
+    expect(instructions).toContain('short paragraphs');
+    expect(instructions).toContain('use numbered lists');
+    expect(instructions).toContain('Keep headings minimal');
+    expect(instructions).toContain('Do not output markdown tables');
+    expect(instructions).toContain('Do not output raw JSON');
+    expect(instructions).toContain('convert it into concise Traditional Chinese explanation');
+    expect(instructions).toContain('End cleanly without meta commentary');
+  });
+
+  test('adjusts tool-json explanation language when response language changes', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const buildResponseFormatInstructions = getRequiredFunction<
+      (responseStyle: {
+        language: string;
+        paragraphStyle: 'short' | 'medium' | 'long';
+        useNumberedListsForAdvice: boolean;
+        allowMarkdownTables: boolean;
+        allowRawJson: boolean;
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).buildResponseFormatInstructions,
+      'buildResponseFormatInstructions'
+    );
+
+    const instructions = buildResponseFormatInstructions({
+      language: 'en',
+      paragraphStyle: 'short',
+      useNumberedListsForAdvice: true,
+      allowMarkdownTables: false,
+      allowRawJson: false,
+    });
+
+    expect(instructions).toContain('Use en.');
+    expect(instructions).toContain('convert it into concise explanation in en');
+    expect(instructions).not.toContain('Traditional Chinese explanation');
+  });
+
+  test('uses allowRawJson as the single source of truth for raw-json guidance', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const buildResponseFormatInstructions = getRequiredFunction<
+      (responseStyle: {
+        language: string;
+        paragraphStyle: 'short' | 'medium' | 'long';
+        useNumberedListsForAdvice: boolean;
+        allowMarkdownTables: boolean;
+        allowRawJson: boolean;
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).buildResponseFormatInstructions,
+      'buildResponseFormatInstructions'
+    );
+
+    const disallowInstructions = buildResponseFormatInstructions({
+      language: 'zh-TW',
+      paragraphStyle: 'short',
+      useNumberedListsForAdvice: true,
+      allowMarkdownTables: false,
+      allowRawJson: false,
+    });
+    const allowInstructions = buildResponseFormatInstructions({
+      language: 'zh-TW',
+      paragraphStyle: 'short',
+      useNumberedListsForAdvice: true,
+      allowMarkdownTables: false,
+      allowRawJson: true,
+    });
+
+    expect(disallowInstructions).toContain('Do not output raw JSON');
+    expect(allowInstructions).toContain('Raw JSON is allowed only when the user explicitly asks for it.');
+    expect(allowInstructions).not.toContain('Do not output raw JSON');
+  });
+});
+
+describe('buildResponseStylePromptSection', () => {
+  test('does not append a second hardcoded raw-json ban outside config-driven guidance', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const buildResponseStylePromptSection = getRequiredFunction<
+      (responseStyle: {
+        language: string;
+        paragraphStyle: 'short' | 'medium' | 'long';
+        useNumberedListsForAdvice: boolean;
+        allowMarkdownTables: boolean;
+        allowRawJson: boolean;
+      }) => string[]
+    >(
+      (agentRuntime as Record<string, unknown>).buildResponseStylePromptSection,
+      'buildResponseStylePromptSection'
+    );
+
+    const promptSection = buildResponseStylePromptSection({
+      language: 'zh-TW',
+      paragraphStyle: 'short',
+      useNumberedListsForAdvice: true,
+      allowMarkdownTables: false,
+      allowRawJson: true,
+    });
+
+    expect(promptSection).toEqual([
+      '--- Response Style ---',
+      expect.stringContaining('Raw JSON is allowed only when the user explicitly asks for it.'),
+    ]);
+    expect(promptSection.join('\n')).not.toContain('Never output raw JSON directly to the user.');
+  });
+});
+
+describe('buildCallModelResponseStylePromptLines', () => {
+  test('injects only the response-style section that callModel should place into the system prompt', async () => {
+    const agentRuntime = agentRuntimeModule;
+    const buildCallModelResponseStylePromptLines = getRequiredFunction<
+      (responseStyle: {
+        language: string;
+        paragraphStyle: 'short' | 'medium' | 'long';
+        useNumberedListsForAdvice: boolean;
+        allowMarkdownTables: boolean;
+        allowRawJson: boolean;
+      }) => string[]
+    >(
+      (agentRuntime as Record<string, unknown>).buildCallModelResponseStylePromptLines,
+      'buildCallModelResponseStylePromptLines'
+    );
+    const buildResponseFormatInstructions = getRequiredFunction<
+      (responseStyle: {
+        language: string;
+        paragraphStyle: 'short' | 'medium' | 'long';
+        useNumberedListsForAdvice: boolean;
+        allowMarkdownTables: boolean;
+        allowRawJson: boolean;
+      }) => string
+    >(
+      (agentRuntime as Record<string, unknown>).buildResponseFormatInstructions,
+      'buildResponseFormatInstructions'
+    );
+
+    const responseStyle = {
+      language: 'zh-TW',
+      paragraphStyle: 'short' as const,
+      useNumberedListsForAdvice: true,
+      allowMarkdownTables: false,
+      allowRawJson: false,
+    };
+
+    expect(buildCallModelResponseStylePromptLines(responseStyle)).toEqual([
+      '--- Response Style ---',
+      buildResponseFormatInstructions(responseStyle),
+    ]);
   });
 });
 

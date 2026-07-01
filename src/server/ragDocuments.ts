@@ -258,7 +258,6 @@ const parseMultipartUpload = async (req: Request): Promise<ParsedUploadPayload> 
 };
 
 const parseAdminIdentity = (req: Request): { uploadedBy: string; uploaderRole: 'admin' | 'nutritionist' } | null => {
-  const authorization = String(req.headers.authorization || '').trim();
   const headerUserId = String(req.headers['x-admin-user-id'] || '').trim();
   const headerRole = String(req.headers['x-admin-role'] || '').trim().toLowerCase();
 
@@ -266,13 +265,6 @@ const parseAdminIdentity = (req: Request): { uploadedBy: string; uploaderRole: '
     return {
       uploadedBy: headerUserId,
       uploaderRole: headerRole,
-    };
-  }
-
-  if (authorization.length > 0) {
-    return {
-      uploadedBy: 'authorized-user',
-      uploaderRole: 'admin',
     };
   }
 

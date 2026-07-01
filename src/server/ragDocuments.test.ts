@@ -215,4 +215,17 @@ describe('createRagApiRouter', () => {
       ok: false,
     });
   });
+
+  test('rejects admin document routes when only Authorization is provided', async () => {
+    const response = await fetch(`${baseUrl}/api/rag/documents`, {
+      headers: {
+        Authorization: 'Bearer not-enough',
+      },
+    });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({
+      error: 'admin_auth_required',
+      ok: false,
+    });
+  });
 });

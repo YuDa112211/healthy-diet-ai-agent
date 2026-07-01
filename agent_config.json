@@ -1,0 +1,39 @@
+{
+  "agent": {
+    "name": "Healthy Diet AI Agent",
+    "description": "Nutrition and healthy-diet advisor",
+    "system_prompt_file": "knowledge_base/AGENT.md",
+    "skills_index_file": "knowledge_base/SKILL_INDEX.md",
+    "rules_file": "knowledge_base/NUTRITION_RULES.md"
+  },
+  "response_style": {
+    "language": "zh-TW",
+    "paragraph_style": "short",
+    "use_numbered_lists_for_advice": true,
+    "allow_markdown_tables": false,
+    "allow_raw_json": false
+  },
+  "features": {
+    "mohw_enabled": true
+  },
+  "rag": {
+    "enabled_sources": [
+      "nutrition_rules",
+      "mohw_news",
+      "uploaded_knowledge"
+    ],
+    "paths": {
+      "knowledge_base_dir": "knowledge_base",
+      "nutrition_rules_file": "knowledge_base/NUTRITION_RULES.md",
+      "mohw_articles_dir": "knowledge_base/mohw_clarifications/articles",
+      "uploaded_markdown_dir": "knowledge_base/ingested_markdown"
+    },
+    "search": {
+      "cache_ttl_ms": 120000,
+      "max_keywords": 48,
+      "chunk_chars": 900,
+      "default_top_k": 5,
+      "max_top_k": 12
+    }
+  }
+}
