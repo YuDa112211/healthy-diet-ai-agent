@@ -1,5 +1,6 @@
 ﻿import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
+import { getStorage } from '../src/storage/runtime';
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.SUPABASE_URL || '';
@@ -195,9 +196,18 @@ export const logDietWithClientForTest = logDietWithClient;
 export const logDietTool = tool(
   async (input: LogDietInput) => {
     try {
-      const { client, error: configError } = getSupabaseOrError();
-      if (configError || !client) return configError || 'Supabase is not configured.';
-      return await logDietWithClient(client, input);
+      const storage = await getStorage();
+      return await storage.insertChatHistory({
+        roomId: input.room_id,
+        userId: input.user_id,
+        userMessage: input.user_message,
+        imagePath: input.image_path,
+        title: input.title,
+        aiAnalysisReport: input.ai_analysis_report || '',
+        dietReport: input.diet_report,
+        recordType: input.record_type || 'chat',
+        summaryText: input.summary_text,
+      });
     } catch (error: any) {
       return `log_diet_history exception: ${error.message}`;
     }
@@ -294,9 +304,48 @@ export const getChatHistoryWithClientForTest = getChatHistoryWithClient;
 
 export const getChatHistoryTool = tool(
   async (input: GetChatHistoryInput) => {
-    const { client, error: configError } = getSupabaseOrError();
-    if (configError || !client) return configError || 'Supabase is not configured.';
-    return getChatHistoryWithClient(client, input);
+    try {
+      const storage = await getStorage();
+      const rows = await storage.getChatHistory({
+        roomId: input.room_id,
+        limit: input.limit,
+        recordType: input.record_type,
+        chatHistoryIds: input.chat_history_ids,
+        dateFrom: input.date_from,
+        dateTo: input.date_to,
+      });
+
+      if (input.format === 'raw') return JSON.stringify(rows);
+      if (rows.length === 0) return 'No history found for this room.';
+
+      const lines: string[] = [];
+      for (const row of rows) {
+        const time = row.created_at ? new Date(row.created_at).toISOString() : 'unknown_time';
+        const header = row.title?.trim()
+          ? `[${time}] ${row.title.trim()}`
+          : `[${time}] conversation`;
+        lines.push(header);
+
+        if (row.summary?.trim()) {
+          lines.push(`- summary: ${shorten(row.summary, 260)}`);
+        } else {
+          if (row.user_message?.trim()) lines.push(`- user: ${shorten(row.user_message, 140)}`);
+          if (row.ai_analysis_report?.trim()) {
+            lines.push(`- assistant: ${shorten(row.ai_analysis_report, 200)}`);
+          }
+        }
+
+        if (input.include_diet_report && row.diet_report != null) {
+          lines.push(`- diet_report: ${shorten(JSON.stringify(row.diet_report), 180)}`);
+        }
+
+        lines.push('');
+      }
+
+      return lines.join('\n').trim();
+    } catch (error: any) {
+      return `Failed to read history: ${error.message}`;
+    }
   },
   {
     name: 'get_chat_history',
@@ -317,21 +366,22 @@ export const getChatHistoryTool = tool(
 
 export const getUserProfileTool = tool(
   async ({ user_id }) => {
-    const { client, error: configError } = getSupabaseOrError();
-    if (configError || !client) return configError || 'Supabase is not configured.';
-
-    const { data, error } = await withTimeout(
-      client
-        .from('users')
-        .select('nickname, height, weight, age, gender, taboo, disease')
-        .eq('id', user_id)
-        .single(),
-      SUPABASE_QUERY_TIMEOUT_MS,
-      'get user profile'
-    );
-
-    if (error) return `Failed to read user profile: ${error.message}`;
-    return JSON.stringify(data);
+    try {
+      const storage = await getStorage();
+      const data = await storage.getUserProfile(user_id);
+      if (!data) return 'Failed to read user profile: user not found';
+      return JSON.stringify({
+        nickname: data.nickname,
+        height: data.height,
+        weight: data.weight,
+        age: data.age,
+        gender: data.gender,
+        taboo: data.taboo,
+        disease: data.disease,
+      });
+    } catch (error: any) {
+      return `Failed to read user profile: ${error.message}`;
+    }
   },
   {
     name: 'get_user_profile',
@@ -357,20 +407,9 @@ export const updateUserProfileTool = tool(
     disease_to_remove,
   }) => {
     try {
-      const { client, error: configError } = getSupabaseOrError();
-      if (configError || !client) return configError || 'Supabase is not configured.';
-
-      const { data: user, error: fetchErr } = await withTimeout(
-        client
-          .from('users')
-          .select('nickname, avatar_url, height, weight, age, gender, taboo, disease')
-          .eq('id', user_id)
-          .single(),
-        SUPABASE_QUERY_TIMEOUT_MS,
-        'fetch user profile for update'
-      );
-
-      if (fetchErr) return `Failed to fetch user profile: ${fetchErr.message}`;
+      const storage = await getStorage();
+      const user = await storage.getUserProfile(user_id);
+      if (!user) return 'Failed to fetch user profile: user not found';
 
       let currentTaboo = Array.isArray(user.taboo)
         ? user.taboo
@@ -411,12 +450,17 @@ export const updateUserProfileTool = tool(
 
       if (Object.keys(updatePayload).length === 0) return 'No profile fields provided to update.';
 
-      const { error: updateErr } = await withTimeout(
-        client.from('users').update(updatePayload).eq('id', user_id),
-        SUPABASE_QUERY_TIMEOUT_MS,
-        'update user profile'
-      );
-      if (updateErr) return `Failed to update profile: ${updateErr.message}`;
+      await storage.updateUserProfile({
+        userId: user_id,
+        nickname: updatePayload.nickname as string | undefined,
+        avatarUrl: updatePayload.avatar_url as string | undefined,
+        height: updatePayload.height as number | undefined,
+        weight: updatePayload.weight as number | undefined,
+        age: updatePayload.age as number | undefined,
+        gender: updatePayload.gender as string | undefined,
+        taboo: (updatePayload.taboo as string[] | undefined) ?? currentTaboo,
+        disease: (updatePayload.disease as string[] | undefined) ?? currentDisease,
+      });
 
       const nextNickname = (updatePayload.nickname as string | undefined) ?? user.nickname ?? 'unknown';
       const nextAvatarUrl = (updatePayload.avatar_url as string | undefined) ?? user.avatar_url ?? 'unknown';

@@ -29,6 +29,8 @@ import {
   REQUEST_BODY_LIMIT,
   urlencodedBodyParser,
 } from './serverHandlers';
+import { formatStartupBanner, resolveStorageBackend } from './server/httpRuntime';
+import { getStorage } from './storage/runtime';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8001;
@@ -64,17 +66,6 @@ app.get('/ping', pingHandler);
 
 app.use(errorHandler);
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log('\nDiet Manager Agent Server started');
-  console.log(`Thread-based memory ready (Supabase): ${isSupabaseReady}`);
-  console.log(`API URL: http://localhost:${PORT}/api/chat`);
-  console.log(`LLM base URL: ${AI_API_URL}`);
-  console.log(`Request body limit: ${REQUEST_BODY_LIMIT}`);
-  console.log(
-    `MOHW news auto-sync: enabled=${MOHW_NEWS_SYNC_ENABLED} intervalMin=${MOHW_NEWS_SYNC_INTERVAL_MINUTES} runOnStart=${MOHW_NEWS_SYNC_RUN_ON_START}`
-  );
-});
-
 let mohwSyncRunning = false;
 const runMohwSyncSafely = async (trigger: 'startup' | 'interval'): Promise<void> => {
   if (mohwSyncRunning) {
@@ -94,28 +85,46 @@ const runMohwSyncSafely = async (trigger: 'startup' | 'interval'): Promise<void>
   }
 };
 
-if (MOHW_NEWS_SYNC_ENABLED) {
-  const intervalMs = MOHW_NEWS_SYNC_INTERVAL_MINUTES * 60 * 1000;
-  setInterval(() => {
-    void runMohwSyncSafely('interval');
-  }, intervalMs);
+const startServer = async () => {
+  const storage = await getStorage();
+  await storage.ensureReady();
 
-  if (MOHW_NEWS_SYNC_RUN_ON_START) {
-    void runMohwSyncSafely('startup');
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n${formatStartupBanner({
+      backend: resolveStorageBackend(),
+      port: PORT,
+      aiApiUrl: AI_API_URL,
+    })}`);
+    console.log(`Thread-based memory ready (Supabase): ${isSupabaseReady}`);
+    console.log(`Request body limit: ${REQUEST_BODY_LIMIT}`);
+    console.log(
+      `MOHW news auto-sync: enabled=${MOHW_NEWS_SYNC_ENABLED} intervalMin=${MOHW_NEWS_SYNC_INTERVAL_MINUTES} runOnStart=${MOHW_NEWS_SYNC_RUN_ON_START}`
+    );
+  });
+
+  if (MOHW_NEWS_SYNC_ENABLED) {
+    const intervalMs = MOHW_NEWS_SYNC_INTERVAL_MINUTES * 60 * 1000;
+    setInterval(() => {
+      void runMohwSyncSafely('interval');
+    }, intervalMs);
+
+    if (MOHW_NEWS_SYNC_RUN_ON_START) {
+      void runMohwSyncSafely('startup');
+    }
   }
-}
 
-server.on('error', (error) => {
-  console.error('[SERVER] Listen error:', error);
-});
+  server.on('error', (error) => {
+    console.error('[SERVER] Listen error:', error);
+  });
 
-server.on('close', () => {
-  console.error('[SERVER] HTTP server closed.');
-});
+  server.on('close', () => {
+    console.error('[SERVER] HTTP server closed.');
+  });
 
-if (typeof (server as { ref?: () => void }).ref === 'function') {
-  (server as { ref: () => void }).ref();
-}
+  if (typeof (server as { ref?: () => void }).ref === 'function') {
+    (server as { ref: () => void }).ref();
+  }
+};
 
 process.on('unhandledRejection', (reason) => {
   console.error('[PROCESS] Unhandled Rejection:', reason);
@@ -124,3 +133,5 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (error) => {
   console.error('[PROCESS] Uncaught Exception:', error);
 });
+
+void startServer();

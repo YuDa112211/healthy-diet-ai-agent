@@ -77,3 +77,58 @@
   - Removed: `none`
 - Notes:
   - Future feature work must update both READMEs and append a new change entry here when behavior changes.
+## 2026-07-01 12:00 CST
+
+- Summary: Added standalone SQLite mode, shared storage adapters, terminal CLI support, and rewritten multilingual deployment docs.
+- Author: Codex
+- Scope:
+  - storage
+  - cli
+  - docker
+  - docs
+- Files:
+  - `src/storage/runtime.ts`
+  - `src/storage/sqlite/adapter.ts`
+  - `src/storage/supabase/adapter.ts`
+  - `src/cli.ts`
+  - `src/serverHandlers.ts`
+  - `src/server/ragDocuments.ts`
+  - `src/server/knowledgeIngestion.ts`
+  - `README.md`
+  - `README_zh.md`
+  - `README_jp.md`
+- API:
+  - Added: `none`
+  - Changed: `startup and deployment behavior`
+  - Removed: `none`
+- Env:
+  - Added: `STORAGE_BACKEND`, `SQLITE_DB_PATH`, `CLI_USER_ID`, `CLI_THREAD_ID`
+  - Changed: `none`
+  - Removed: `none`
+- Notes:
+  - Standalone deployments now default to SQLite.
+  - Supabase mode remains available for existing integrations.
+  - Added standalone SQLite schema and sample seed references under `docs/sqlite/`.
+
+## 2026-07-01 12:20 CST
+
+- Summary: Added project-background notes to the English, Chinese, and Japanese READMEs explaining the move from stack-coupled usage to an independent service direction.
+- Author: Codex
+- Scope:
+  - repository documentation
+- Files:
+  - `README.md`
+  - `README_zh.md`
+  - `README_jp.md`
+  - `CHANGELOG_CODEX.md`
+- API:
+  - Added: `none`
+  - Changed: `none`
+  - Removed: `none`
+- Env:
+  - Added: `none`
+  - Changed: `none`
+  - Removed: `none`
+- Notes:
+  - Documented the original relationship with `PU-Hub/healthy-diet` and `healthy-diet-web`.
+  - Clarified why this repository is now being presented as an independent deployable project.

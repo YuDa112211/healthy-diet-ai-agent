@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { requestLoggerMiddleware } from './httpRuntime';
+import {
+  formatStartupBannerForTest,
+  requestLoggerMiddleware,
+  resolveStorageBackendForTest,
+} from './httpRuntime';
 
 const createResponse = (statusCode: number) => {
   let finishHandler: (() => void) | undefined;
@@ -69,5 +73,49 @@ describe('requestLoggerMiddleware', () => {
     } finally {
       console.log = originalLog;
     }
+  });
+});
+
+describe('resolveStorageBackendForTest', () => {
+  test('defaults to sqlite when STORAGE_BACKEND is missing', () => {
+    const originalBackend = process.env.STORAGE_BACKEND;
+    delete process.env.STORAGE_BACKEND;
+
+    try {
+      expect(resolveStorageBackendForTest()).toBe('sqlite');
+    } finally {
+      if (originalBackend === undefined) {
+        delete process.env.STORAGE_BACKEND;
+      } else {
+        process.env.STORAGE_BACKEND = originalBackend;
+      }
+    }
+  });
+
+  test('returns supabase when STORAGE_BACKEND is set to supabase', () => {
+    const originalBackend = process.env.STORAGE_BACKEND;
+    process.env.STORAGE_BACKEND = 'supabase';
+
+    try {
+      expect(resolveStorageBackendForTest()).toBe('supabase');
+    } finally {
+      if (originalBackend === undefined) {
+        delete process.env.STORAGE_BACKEND;
+      } else {
+        process.env.STORAGE_BACKEND = originalBackend;
+      }
+    }
+  });
+});
+
+describe('formatStartupBannerForTest', () => {
+  test('includes the selected storage backend and port', () => {
+    expect(
+      formatStartupBannerForTest({
+        backend: 'sqlite',
+        port: 8001,
+        aiApiUrl: 'http://localhost:8080/v1',
+      })
+    ).toContain('Storage backend: sqlite');
   });
 });

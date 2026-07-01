@@ -1,171 +1,208 @@
 # Healthy Diet AI Agent
 
-這是一個以 `Express + LangGraph + LangChain + Supabase` 建構的健康飲食 AI 後端，主要用途是處理食物圖片分析、飲食與營養問答、知識檢索、使用者資料更新審批，以及後台知識文件管理。
+Healthy Diet AI Agent 是一個以 Bun + TypeScript 建立的營養與健康飲食後端，支援聊天、食物圖片分析、RAG 文件知識檢索、知識圖譜與衛福部資料同步。
 
-## 專案目的
+目前這個 repo 已經支援兩種部署模式：
 
-這個專案希望提供一個能落地的飲食助理後端，支援以下情境：
+- Standalone mode：使用 SQLite，能獨立透過 Docker、HTTP API 或 terminal CLI 使用
+- Integration mode：使用 Supabase，保留與既有 `health-diet-api` 生態整合的能力
 
-- 分析使用者上傳的餐點圖片
-- 推測菜色、食材與營養相關資訊
-- 依據本地知識庫、MOHW 資料與上傳文件回答飲食問題
-- 在更新使用者個人資料前，先走核准流程
-- 管理員可上傳 PDF、DOCX、TXT、MD 文件做 RAG 使用
-- 建立知識圖譜，讓後續檢索與關聯查詢更容易擴充
+## 專案背景
 
-## 技術組成
+這個專案原本是為了搭配以下兩個專案而建立：
 
-- Runtime：`Bun`、`TypeScript`
-- Web Server：`Express 5`
-- Agent：`LangGraph`、`LangChain`
-- 資料庫：`Supabase`
-- 影像/文件處理：`sharp`、`mammoth`、`pdf-parse`、`cheerio`
-- 模型來源：
-  - 本地 OpenAI 相容端點：`AI_API_URL`
-  - Google OpenAI 相容端點：`GOOGLE_BASE_URL`
+- [`PU-Hub/healthy-diet`](https://github.com/PU-Hub/healthy-diet) 作為 API 端專案
+- [`archie0732/healthy-diet-web`](https://github.com/archie0732/healthy-diet-web) 作為前端 Web 專案
 
-## 重要連結與入口
+後來因為這個 repo 本身開始有更多人關注與查看，所以專案方向做了調整。現在除了保留和原本專案整合的能力，也把這個 repo 逐步整理成可以獨立部署、獨立使用的 AI agent 服務。
 
-- 主要聊天 API：`POST /api/chat`
-- 健康檢查：`GET /ping`
-- RAG 搜尋：`GET|POST /api/rag/search`
-- RAG 文件 API 基底：`/api/rag/documents`
-- 知識圖譜 API 基底：`/api/graph`
-- MOHW 同步 API：`POST /api/news/sync`
-- 圖片靜態路徑：`/images/...`
+## 特色
 
-主要檔案路徑：
+- 可切換 storage backend：`sqlite` 或 `supabase`
+- 可直接獨立部署，不必依賴 `health-diet-api`
+- 提供 HTTP API 與 terminal CLI
+- Docker 預設走 standalone SQLite 模式
+- 支援本地 knowledge base 與上傳文件 ingestion
+- 保留 Supabase 整合能力，適合接回原本專案
 
-- 伺服器入口：`src/index.ts`
-- API handlers：`src/serverHandlers.ts`
-- Agent 執行流程：`src/server/agentRuntime.ts`
-- 模型路由：`src/server/modelRouting.ts`
-- RAG 文件管理：`src/server/ragDocuments.ts`
-- 知識圖譜：`src/server/knowledgeGraph.ts`
-- RAG 搜尋：`src/server/ragSearch.ts`
-- MOHW 同步：`src/server/mohwNews.ts`
-- MOHW 抓取腳本：`scripts/sync-mohw-clarifications.ts`
-- 營養規則：`knowledge_base/NUTRITION_RULES.md`
-- Agent 內部提示資料：
-  - `knowledge_base/AGENT.md`
-  - `knowledge_base/SKILL_INDEX.md`
-- Codex 維護規範：`AGENT.md`
-- Codex 版本紀錄：`CHANGELOG_CODEX.md`
-- 英文文件：`README.md`
+## 主要路徑
 
-## 快速開始
+- Server 入口：`src/index.ts`
+- CLI 入口：`src/cli.ts`
+- Chat handler：`src/serverHandlers.ts`
+- Agent runtime：`src/server/agentRuntime.ts`
+- Storage facade：`src/storage/runtime.ts`
+- SQLite backend：`src/storage/sqlite/adapter.ts`
+- Supabase backend：`src/storage/supabase/adapter.ts`
+- 文件管理 API：`src/server/ragDocuments.ts`
+- 知識 ingestion API：`src/server/knowledgeIngestion.ts`
 
-### 安裝
+## 部署模式
 
-```bash
-npm install
-```
+### 1. Standalone SQLite 模式
 
-或
+適合：
+
+- 自己在本機部署
+- 直接用 Docker 跑
+- 想用 terminal 下 prompt
+- 不想先準備 Supabase
+
+特性：
+
+- 不需要 `SUPABASE_URL` 與 `SUPABASE_SERVICE_KEY`
+- 啟動時自動建立 SQLite schema
+- DB 路徑由 `SQLITE_DB_PATH` 控制
+
+### 2. Supabase Integration 模式
+
+適合：
+
+- 已經有既有 Supabase schema
+- 想保留與原本系統的整合方式
+- 想讓這個 agent 作為既有系統中的一個服務
+
+特性：
+
+- 維持既有 API 路由
+- 聊天記錄、使用者資料、文件 metadata 可走 Supabase
+
+## 安裝
 
 ```bash
 bun install
+cp .env.example .env
 ```
 
-### 環境變數
+## 重要環境變數
 
-請將 `.env.example` 複製成 `.env`，再填入實際值。
+核心：
 
-核心變數：
+- `PORT`
+- `AI_API_URL`
+- `STORAGE_BACKEND=sqlite|supabase`
+- `SQLITE_DB_PATH`
+- `CLI_USER_ID`
+- `CLI_THREAD_ID`
 
-- `PORT`：伺服器埠號，預設 `8001`
-- `AI_API_URL`：本地 OpenAI 相容模型服務 URL
-- `SUPABASE_URL`：Supabase 專案網址
-- `SUPABASE_SERVICE_KEY`：Supabase service role key
-- `GEMINI_AI_API`：Google 路由優先使用的 API key
-- `GEMINI_API_KEY`：Google 路由備援 key
-- `GOOGLE_CHAT_MODEL`：Google 路由使用的模型名稱，預設為 `gemma-4-31b-it`
-- `GOOGLE_BASE_URL`：Google OpenAI 相容 base URL
-- `MOHW_NEWS_SYNC_ENABLED`：是否開啟 MOHW 自動同步
-- `MOHW_NEWS_SYNC_INTERVAL_MINUTES`：同步週期
-- `MOHW_NEWS_SYNC_RUN_ON_START`：啟動時是否先同步一次
-- `RAG_DOCS_ROOT`：文件根路徑提示
-- `RAG_WORKER_*`：env example 已存在的 worker 相關參數
+Supabase 整合模式：
 
-### 啟動
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
 
-```bash
-bun run dev
+Google 模型路由：
+
+- `GEMINI_AI_API`
+- `GEMINI_API_KEY`
+- `GOOGLE_CHAT_MODEL`
+- `GOOGLE_BASE_URL`
+
+## Standalone 本地使用
+
+建議 `.env`：
+
+```env
+PORT=8001
+AI_API_URL=http://127.0.0.1:8080/v1/
+STORAGE_BACKEND=sqlite
+SQLITE_DB_PATH=./data/healthy-diet-agent.db
+CLI_USER_ID=local-user
+CLI_THREAD_ID=local-thread
 ```
 
-或
+啟動 HTTP server：
 
 ```bash
 bun run start
 ```
 
-預設會啟動在 `http://localhost:8001`。
+預設網址：
 
-## API 一覽
+- `http://localhost:8001`
+- chat endpoint：`POST /api/chat`
+- health check：`GET /ping`
 
-### 1. 聊天與對話相關 API
+## Terminal CLI 使用
 
-- `POST /api/chat`
-  - 主要 SSE 聊天入口
-  - 支援文字、圖片、網址驗證、使用者 profile context、tool call 與背景資料持久化
-  - 檔案：`src/serverHandlers.ts`
-- `POST /api/approve`
-  - 核准或拒絕待寫入的使用者資料更新
-  - 檔案：`src/serverHandlers.ts`
-- `POST /api/generate_title`
-  - 產生對話標題
-  - 檔案：`src/serverHandlers.ts`
-- `GET /ping`
-  - 健康檢查
-  - 檔案：`src/serverHandlers.ts`
+直接在 terminal 下 prompt：
 
-`POST /api/chat` 範例：
-
-```json
-{
-  "message": "請幫我分析這份午餐",
-  "thread_id": "thread-1",
-  "chat_history_id": "history-1",
-  "user_id": "user-123",
-  "model_source": "auto"
-}
+```bash
+bun run cli -- --message "Analyze my lunch"
 ```
 
-聊天流程特性：
+也可以指定使用者、thread 與 model source：
 
-- `model_source: "auto"`：若有 Google key，優先走 Google，失敗時可回退 local
-- `model_source: "local"`：強制走 local
-- 若只有圖片沒有文字，後端會自動補預設提示
-- 若訊息中有多個 URL，只會驗證第一個
-- 若偵測到明確個資更新，會先提出 proposal，再透過 `POST /api/approve` 寫入
+```bash
+bun run cli -- --message "Give me a low sugar dinner idea" --user-id demo-user --thread-id demo-thread --model-source auto
+```
 
-目前預設聊天模型路由：
+## 可選：手動初始化 SQLite
 
-- local chat model：`gemma`
-- Google chat model：`gemma-4-31b-it`
+一般情況下不需要手動建表，因為 app 啟動時會自動 bootstrap SQLite schema。
 
-### 2. 知識搜尋 API
+如果你想自己先建立或匯入本地測試資料，可以使用：
+
+- schema：`docs/sqlite/schema.sql`
+- sample seed：`docs/sqlite/seed.sample.sql`
+
+如果你的環境有 `sqlite3`：
+
+```bash
+sqlite3 ./data/healthy-diet-agent.db < docs/sqlite/schema.sql
+sqlite3 ./data/healthy-diet-agent.db < docs/sqlite/seed.sample.sql
+```
+
+`seed.sample.sql` 只是本地開發示例，你可以先修改裡面的使用者、聊天室與對話資料再匯入。
+
+## Docker 部署
+
+Docker 預設就是 standalone SQLite 模式。
+
+```bash
+docker compose up --build
+```
+
+預設行為：
+
+- `STORAGE_BACKEND=sqlite`
+- `SQLITE_DB_PATH=/app/data/healthy-diet-agent.db`
+- 透過 `./data:/app/data` 持久化 SQLite 資料
+
+常用掛載：
+
+- `./data`
+- `./knowledge_base`
+- `./users_images`
+
+## 與原專案 / Supabase 整合
+
+如果你要接回既有系統，設定：
+
+```env
+STORAGE_BACKEND=supabase
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=your-service-role-key
+```
+
+說明：
+
+- 現有 API 路由仍保留
+- 真正的 storage 寫入已統一經過 shared storage layer
+- 適合接回既有 `health-diet-api` 或其他 Supabase 架構
+
+## API 概覽
+
+### Chat
+
+- `POST /api/chat`
+- `POST /api/approve`
+- `POST /api/generate_title`
+- `GET /ping`
+
+### RAG 與知識文件
 
 - `GET /api/rag/search`
 - `POST /api/rag/search`
-
-搜尋來源：
-
-- `knowledge_base/NUTRITION_RULES.md`
-- `knowledge_base/mohw_clarifications/articles/*.md`
-- `knowledge_base/ingested_markdown/**/*.md`
-
-實作檔案：
-
-- handler：`src/server/ragSearch.ts`
-- 搜尋工具：`agent_skills/file_tools.ts`
-
-### 3. RAG 文件管理 API
-
-實作：`src/server/ragDocuments.ts`
-
-端點：
-
 - `GET /api/rag/documents`
 - `POST /api/rag/documents`
 - `GET /api/rag/documents/:document_id`
@@ -176,26 +213,13 @@ bun run start
 - `GET /api/rag/sources/:document_id/file`
 - `GET /api/rag/sources/:document_id/preview`
 
-功能：
+### Knowledge ingestion
 
-- 支援 multipart 上傳
-- 支援副檔名：`pdf`、`docx`、`txt`、`md`
-- 以 SHA-256 判斷重複文件
-- 抽取文字並轉成 markdown
-- 文件 metadata 存放於 Supabase
-- 提供檔案預覽與原檔下載/查看
+- `POST /api/admin/knowledge/upload`
+- `POST /api/admin/knowledge/ingest/:id`
+- `GET /api/admin/knowledge/jobs/:jobId`
 
-管理權限：
-
-- 需帶：
-  - `x-admin-user-id` 與 `x-admin-role: admin|nutritionist`
-  - 或 `Authorization` header
-
-### 4. 知識圖譜 API
-
-實作：`src/server/knowledgeGraph.ts`
-
-端點：
+### Knowledge graph
 
 - `POST /api/graph/extract-all`
 - `GET /api/graph/status`
@@ -206,156 +230,46 @@ bun run start
 - `GET /api/graph/nodes/:node_id`
 - `GET /api/graph/relations/:relation_id/evidence`
 
-功能：
-
-- 從以下來源抽取節點、關係與證據：
-  - 上傳知識文件
-  - `NUTRITION_RULES.md`
-  - MOHW 本地 markdown
-- 快取檔案位置：`knowledge_base/graph/graph-cache.json`
-
-### 5. 後台知識匯入 API
-
-已在 `src/index.ts` 註冊，主要實作在 `src/server/knowledgeIngestion.ts`。
-
-端點：
-
-- `POST /api/admin/knowledge/upload`
-- `POST /api/admin/knowledge/ingest/:id`
-- `GET /api/admin/knowledge/jobs/:jobId`
-
-相關文件：
-
-- `Doc/knowledge_ingestion_api_m1.md`
-- `Doc/supabase_knowledge_ingestion_m1.sql`
-
-### 6. MOHW 新聞/澄清資料 API
-
-實作：`src/server/mohwNews.ts`
-
-端點：
+### 衛福部同步
 
 - `POST /api/news/sync`
 - `GET /api/news`
 - `GET /api/news/:id`
 - `GET /api/news-files`
 
-相關腳本：
+## 本地資料與知識路徑
 
-- `bun run sync:mohw`
-- 檔案：`scripts/sync-mohw-clarifications.ts`
+- SQLite 檔案：`data/healthy-diet-agent.db` 或 `SQLITE_DB_PATH`
+- 使用者圖片：`users_images/`
+- 上傳原始文件：`knowledge_base/uploads/`
+- 解析後 markdown：`knowledge_base/ingested_markdown/`
+- 營養規則：`knowledge_base/NUTRITION_RULES.md`
+- 衛福部資料：`knowledge_base/mohw_clarifications/`
 
-輸出位置：
+## 測試
 
-- `knowledge_base/mohw_clarifications/`
+重點測試：
 
-## 主要功能模組
+```bash
+bun test src/server/httpRuntime.test.ts src/storage/runtime.test.ts src/server/serverHandlers.test.ts src/server/dbTools.test.ts src/server/ragDocuments.test.ts src/cli.test.ts
+```
 
-### Agent runtime 與協作流程
+全部 Bun 測試：
 
-檔案：
+```bash
+bun test
+```
 
-- `src/server/agentRuntime.ts`
-- `src/server/modelRouting.ts`
-- `src/server/chatPayload.ts`
-- `src/server/profileApproval.ts`
+## 備註
 
-負責內容：
+- 如果你要自己架設，建議優先用 SQLite standalone 模式
+- 如果你要接既有系統，再切到 Supabase mode
+- standalone mode 不需要 `health-diet-api`
+- 不論哪種模式，都仍需要可用的模型端點，例如 `AI_API_URL`
 
-- 建立 LangGraph workflow
-- 在 Google 與 local 模型之間做路由
-- SSE 串流回應
-- tool 執行狀態追蹤
-- 將 user profile、對話摘要、營養規則注入 prompt
-- 有圖片時強制先跑 `analyze_food_image`
-- 偵測個資更新 proposal，並接上 approval flow
+## 相關文件
 
-### Agent tools
-
-檔案：
-
-- `agent_skills/file_tools.ts`
-- `agent_skills/vision_model.ts`
-- `agent_skills/calc_tools.ts`
-- `agent_skills/db_tools.ts`
-- `agent_skills/summarizer_tools.ts`
-- `agent_skills/fetch_web.ts`
-
-用途：
-
-- `file_tools.ts`：讀取、更新、搜尋本地知識 markdown
-- `vision_model.ts`：分析食物圖片，回傳菜色/食材摘要
-- `calc_tools.ts`：營養估算相關工具
-- `db_tools.ts`：聊天紀錄、使用者資料與資料庫操作
-- `summarizer_tools.ts`：對話壓縮
-- `fetch_web.ts`：網址可達性與頁面內容檢查
-
-### 圖片儲存與靜態服務
-
-檔案：
-
-- `src/server/imageStorage.ts`
-- `src/server/workspacePaths.ts`
-- `users_images/`
-
-功能：
-
-- 接收前端送來的圖片
-- 儲存在 workspace 內的使用者資料夾
-- 透過 `/images` 對外提供靜態路徑
-
-### Supabase 整合
-
-檔案：
-
-- `src/server/supabaseRuntime.ts`
-- `agent_skills/db_tools.ts`
-
-程式中使用到的資料表包含：
-
-- `diet_chat_history`
-- `chat_rooms`
-- `users`
-- `knowledge_documents`
-
-對話記憶行為：
-
-- `chat_rooms.summary` 現在作為聊天室的輕量摘要索引，不再只是單一長字串摘要。
-- 每一筆摘要索引都會保存簡短摘要，並帶有 `source_chat_history_ids` 與可選的 `source_summary_history_id`，可回指 `diet_chat_history`。
-- `diet_chat_history` 仍然是完整使用者/助手對話與封存摘要列的真實來源。
-- 舊資料回填 SQL：`Doc/supabase/2026-06-22-chat-room-summary-index-migration.sql`
-
-## 知識來源與文件位置
-
-主要知識檔案：
-
-- `knowledge_base/NUTRITION_RULES.md`
-- `knowledge_base/SKILL_INDEX.md`
-- `knowledge_base/AGENT.md`
-- `knowledge_base/mohw_clarifications/`
-- `knowledge_base/ingested_markdown/`
-- `knowledge_base/graph/`
-
-其他規劃/說明文件：
-
-- `Doc/`
-- `docs/`
-
-## 已知限制
-
-- 目前 RAG 搜尋是本地 keyword scoring，不是向量檢索
-- PDF 抽取依賴文字層，這裡沒有 OCR fallback
-- repo 中部分舊檔可能存在編碼歷史問題
-- Google 路由只有在正確設定 API key 時才會生效
-- 若缺少 `SUPABASE_URL` 或 `SUPABASE_SERVICE_KEY`，部分功能會降級或不可用
-
-## 文件維護規則
-
-只要變更以下內容，就必須同步更新：
-
-- `README.md`
-- `README_zh.md`
-- `CHANGELOG_CODEX.md`
-- 若流程規範本身改變，連 `AGENT.md` 也要一起更新
-
-Codex 維護規則請看根目錄 `AGENT.md`。
+- English README：`README.md`
+- Japanese README：`README_jp.md`
+- Agent 維護規則：`AGENT.md`
+- Codex 變更紀錄：`CHANGELOG_CODEX.md`

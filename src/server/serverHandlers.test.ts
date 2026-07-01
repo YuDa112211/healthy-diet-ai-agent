@@ -61,6 +61,31 @@ describe('persistChatRoomMetaWithClientForTest', () => {
 });
 
 describe('createInitialChatPersistenceForTest', () => {
+  test('uses shared storage when explicit adapter methods are provided', async () => {
+    const roomWrites: Array<Record<string, unknown>> = [];
+    const historyWrites: Array<Record<string, unknown>> = [];
+
+    const result = await createInitialChatPersistenceForTest({
+      threadId: 'room-storage-1',
+      userId: '00000000-0000-0000-0000-000000000010',
+      userMessage: 'storage path test',
+      isNewConversation: true,
+      storage: {
+        upsertChatRoom: async (input) => {
+          roomWrites.push(input as unknown as Record<string, unknown>);
+        },
+        insertChatHistory: async (input) => {
+          historyWrites.push(input as unknown as Record<string, unknown>);
+          return { id: 'chat-storage-1' };
+        },
+      } as never,
+    });
+
+    expect(result.chatHistoryId).toBe('chat-storage-1');
+    expect(roomWrites[0]?.threadId).toBe('room-storage-1');
+    expect(historyWrites[0]?.roomId).toBe('room-storage-1');
+  });
+
   test('upserts chat room and inserts an initial chat row before streaming begins', async () => {
     const roomWrites: Array<Record<string, unknown>> = [];
     const historyWrites: Array<Record<string, unknown>> = [];

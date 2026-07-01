@@ -9,10 +9,13 @@ services:
       - .env
     environment:
       PORT: 8001
+      STORAGE_BACKEND: sqlite
+      SQLITE_DB_PATH: /app/data/healthy-diet-agent.db
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "8001:8001"
     volumes:
+      - ./data:/app/data
       - ./knowledge_base:/app/knowledge_base
       - ./users_images:/app/users_images

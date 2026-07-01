@@ -16,6 +16,28 @@ export const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 45000);
 export const PROFILE_LOOKUP_TIMEOUT_MS = Number(process.env.PROFILE_LOOKUP_TIMEOUT_MS || 4000);
 export const AGENT_STREAM_TIMEOUT_MS = Number(process.env.AGENT_STREAM_TIMEOUT_MS || 60000);
 export const USER_PROFILE_CACHE_TTL_MS = Number(process.env.USER_PROFILE_CACHE_TTL_MS || 120000);
+export type StorageBackend = 'sqlite' | 'supabase';
+
+export const resolveStorageBackend = (): StorageBackend => {
+  const rawValue = String(process.env.STORAGE_BACKEND || 'sqlite').trim().toLowerCase();
+  return rawValue === 'supabase' ? 'supabase' : 'sqlite';
+};
+
+export const resolveStorageBackendForTest = resolveStorageBackend;
+
+export const formatStartupBanner = (input: {
+  backend: StorageBackend;
+  port: number;
+  aiApiUrl: string;
+}): string =>
+  [
+    'Diet Manager Agent Server started',
+    `Storage backend: ${input.backend}`,
+    `API URL: http://localhost:${input.port}/api/chat`,
+    `LLM base URL: ${input.aiApiUrl}`,
+  ].join('\n');
+
+export const formatStartupBannerForTest = formatStartupBanner;
 
 export const withTimeout = async <T>(
   promise: Promise<T>,

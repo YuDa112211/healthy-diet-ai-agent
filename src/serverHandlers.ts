@@ -39,6 +39,8 @@ import {
 } from './server/profileApproval';
 import { AI_API_URL, isSupabaseReady, supabase } from './server/supabaseRuntime';
 import { imagesStaticMiddleware } from './server/workspacePaths';
+import { getStorage } from './storage/runtime';
+import type { AppStorage } from './storage/types';
 import type { ConversationSummaryToolResult } from '../agent_skills/conversation_summary_tool';
 import {
   buildRoomSummaryIndexEntry,
@@ -187,28 +189,8 @@ const persistChatHistoryReply = async (input: {
   chatHistoryId: string;
   aiReply: string;
 }) => {
-  if (!supabase) {
-    console.warn('Supabase is not configured; skip chat history persistence.');
-    return;
-  }
-
-  const updatePayload: Record<string, unknown> = {
-    ai_analysis_report: input.aiReply,
-  };
-
-  const { data, error } = await supabase
-    .from('diet_chat_history')
-    .update(updatePayload)
-    .eq('id', input.chatHistoryId)
-    .select('id');
-
-  if (error) {
-    throw new Error(`Failed to update diet_chat_history (${input.chatHistoryId}): ${error.message}`);
-  }
-
-  if (!data || data.length === 0) {
-    throw new Error(`No rows updated in diet_chat_history for id=${input.chatHistoryId}`);
-  }
+  const storage = await getStorage();
+  await storage.updateChatHistoryReply(input);
 };
 
 const insertInitialChatHistoryRow = async (input: {
@@ -218,19 +200,16 @@ const insertInitialChatHistoryRow = async (input: {
   imagePath?: string;
   title?: string;
 }) => {
-  const result = await logDietTool.invoke({
-    room_id: input.threadId,
-    user_id: input.userId,
-    user_message: input.userMessage,
-    image_path: input.imagePath,
+  const storage = await getStorage();
+  const result = await storage.insertChatHistory({
+    roomId: input.threadId,
+    userId: input.userId,
+    userMessage: input.userMessage,
+    imagePath: input.imagePath,
     title: input.title,
-    ai_analysis_report: '__PENDING__',
-    record_type: 'chat',
+    aiAnalysisReport: '__PENDING__',
+    recordType: 'chat',
   });
-
-  if (typeof result === 'string' && result.startsWith('Failed')) {
-    throw new Error(result);
-  }
 
   const insertedId =
     result &&
@@ -295,12 +274,8 @@ const persistChatRoomMeta = async (input: {
   summaryIndexEntries?: RoomSummaryIndexEntry[];
   title?: string;
 }) => {
-  if (!supabase) {
-    console.warn('Supabase is not configured; skip chat room persistence.');
-    return;
-  }
-
-  await persistChatRoomMetaWithClient(supabase, input);
+  const storage = await getStorage();
+  await storage.upsertChatRoom(input);
 };
 
 const createInitialChatPersistence = async ({
@@ -309,6 +284,7 @@ const createInitialChatPersistence = async ({
   userMessage,
   imagePath,
   isNewConversation,
+  storage,
   persistChatRoomMetaFn = persistChatRoomMeta,
   insertChatHistoryRowFn = insertInitialChatHistoryRow,
 }: {
@@ -317,6 +293,7 @@ const createInitialChatPersistence = async ({
   userMessage: string;
   imagePath?: string;
   isNewConversation: boolean;
+  storage?: Pick<AppStorage, 'upsertChatRoom' | 'insertChatHistory'>;
   persistChatRoomMetaFn?: typeof persistChatRoomMeta;
   insertChatHistoryRowFn?: (input: {
     threadId: string;
@@ -330,19 +307,40 @@ const createInitialChatPersistence = async ({
     ? normalizeTitle('', userMessage)
     : undefined;
 
-  await persistChatRoomMetaFn({
-    threadId,
-    userId,
-    title: provisionalTitle,
-  });
+  let insertResult: string | { status?: string; id?: string };
 
-  const insertResult = await insertChatHistoryRowFn({
-    threadId,
-    userId,
-    userMessage,
-    imagePath,
-    title: provisionalTitle,
-  });
+  if (storage) {
+    await storage.upsertChatRoom({
+      threadId,
+      userId,
+      title: provisionalTitle,
+    });
+
+    insertResult = await storage.insertChatHistory({
+      roomId: threadId,
+      userId,
+      userMessage,
+      imagePath,
+      title: provisionalTitle,
+      aiAnalysisReport: '__PENDING__',
+      recordType: 'chat',
+    });
+  } else {
+    await persistChatRoomMetaFn({
+      threadId,
+      userId,
+      title: provisionalTitle,
+    });
+
+    insertResult = await insertChatHistoryRowFn({
+      threadId,
+      userId,
+      userMessage,
+      imagePath,
+      title: provisionalTitle,
+    });
+  }
+
   const chatHistoryId =
     typeof insertResult === 'string'
       ? insertResult
@@ -375,26 +373,14 @@ const fetchExistingRoomSummaryEntries = async (
   threadId: string,
   userId?: string
 ): Promise<RoomSummaryIndexEntry[]> => {
-  if (!supabase) return [];
-
-  let query = supabase
-    .from('chat_rooms')
-    .select('summary')
-    .eq('room_id', threadId)
-    .limit(1);
-
-  if (userId) {
-    query = query.eq('user_id', userId);
-  }
-
-  const { data, error } = await query;
-  if (error) {
-    console.warn(`Failed to read chat_rooms summary for room_id=${threadId}: ${error.message}`);
+  try {
+    const storage = await getStorage();
+    const summary = await storage.getChatRoomSummary(threadId, userId);
+    return parseRoomSummaryIndex(summary);
+  } catch (error) {
+    console.warn(`Failed to read chat_rooms summary for room_id=${threadId}:`, error);
     return [];
   }
-
-  const row = Array.isArray(data) && data.length > 0 ? data[0] : null;
-  return parseRoomSummaryIndex((row as { summary?: unknown } | null)?.summary);
 };
 
 const fetchExistingRoomSummary = async (threadId: string, userId?: string): Promise<string> => {

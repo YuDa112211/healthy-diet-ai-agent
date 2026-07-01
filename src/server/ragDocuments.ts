@@ -8,7 +8,7 @@ import { PDFParse } from 'pdf-parse';
 import { z } from 'zod';
 import { invalidateKnowledgeSearchCache } from '../../agent_skills/file_tools';
 import { ROOT_DIR } from './workspacePaths';
-import { supabase } from './supabaseRuntime';
+import { getStorage } from '../storage/runtime';
 
 const MAX_UPLOAD_BYTES = Number(process.env.RAG_DOCUMENT_MAX_UPLOAD_BYTES || 20 * 1024 * 1024);
 const MAX_EXTRACTED_TEXT_CHARS = Number(process.env.RAG_DOCUMENT_MAX_EXTRACTED_TEXT_CHARS || 350000);
@@ -342,145 +342,31 @@ const mapDocumentRow = (row: Record<string, unknown>): RagDocumentRecord => ({
   errorMessage: row.error_message == null ? null : String(row.error_message),
 });
 
-const buildSupabaseRepository = (): RagDocumentsRepository | null => {
-  const client = supabase;
-  if (!client) return null;
-
-  const selectColumns = [
-    'id',
-    'title',
-    'source_type',
-    'file_name',
-    'file_ext',
-    'mime_type',
-    'file_size_bytes',
-    'file_hash',
-    'storage_path',
-    'uploaded_by',
-    'uploader_role',
-    'status',
-    'created_at',
-    'updated_at',
-    'parsed_md_path',
-    'parse_method',
-    'parsed_char_count',
-    'embedding_model',
-    'error_message',
-  ].join(', ');
-
+const buildStorageRepository = (): RagDocumentsRepository => {
   return {
     async listDocuments() {
-      const result = await client
-        .from('knowledge_documents')
-        .select(selectColumns)
-        .order('created_at', { ascending: false });
-
-      if (result.error) {
-        throw new Error(`Failed to list documents: ${result.error.message}`);
-      }
-      const rows = (result.data || []) as unknown as Record<string, unknown>[];
-      return rows.map((row) => mapDocumentRow(row));
+      const storage = await getStorage();
+      return storage.listKnowledgeDocuments();
     },
     async getDocument(documentId) {
-      const result = await client
-        .from('knowledge_documents')
-        .select(selectColumns)
-        .eq('id', documentId)
-        .maybeSingle();
-
-      if (result.error) {
-        throw new Error(`Failed to query document: ${result.error.message}`);
-      }
-      const data = result.data as Record<string, unknown> | null;
-      return data ? mapDocumentRow(data) : null;
+      const storage = await getStorage();
+      return storage.getKnowledgeDocument(documentId);
     },
     async findDocumentByHash(fileHash) {
-      const result = await client
-        .from('knowledge_documents')
-        .select(selectColumns)
-        .eq('file_hash', fileHash)
-        .maybeSingle();
-
-      if (result.error) {
-        throw new Error(`Failed to query duplicate document: ${result.error.message}`);
-      }
-      const data = result.data as Record<string, unknown> | null;
-      return data ? mapDocumentRow(data) : null;
+      const storage = await getStorage();
+      return storage.findKnowledgeDocumentByHash(fileHash);
     },
     async createDocument(record) {
-      const result = await client
-        .from('knowledge_documents')
-        .insert({
-          id: record.id,
-          title: record.title,
-          source_type: record.sourceType,
-          file_name: record.filename,
-          file_ext: record.fileExt,
-          mime_type: record.mimeType,
-          file_size_bytes: record.sizeBytes,
-          file_hash: record.fileHash,
-          storage_path: record.storagePath,
-          uploaded_by: record.uploadedBy,
-          uploader_role: record.uploaderRole,
-          status: record.status,
-          created_at: record.createdAt,
-          updated_at: record.updatedAt,
-          parsed_md_path: record.parsedMdPath,
-          parse_method: record.parseMethod,
-          parsed_char_count: record.parsedCharCount,
-          embedding_model: record.embeddingModel,
-          error_message: record.errorMessage,
-        })
-        .select(selectColumns)
-        .single();
-
-      if (result.error) {
-        throw new Error(`Failed to insert document: ${result.error.message}`);
-      }
-      return mapDocumentRow(result.data as unknown as Record<string, unknown>);
+      const storage = await getStorage();
+      return storage.createKnowledgeDocument(record);
     },
     async updateDocument(documentId, patch) {
-      const updatePayload: Record<string, unknown> = {};
-      if (patch.title !== undefined) updatePayload.title = patch.title;
-      if (patch.sourceType !== undefined) updatePayload.source_type = patch.sourceType;
-      if (patch.filename !== undefined) updatePayload.file_name = patch.filename;
-      if (patch.fileExt !== undefined) updatePayload.file_ext = patch.fileExt;
-      if (patch.mimeType !== undefined) updatePayload.mime_type = patch.mimeType;
-      if (patch.sizeBytes !== undefined) updatePayload.file_size_bytes = patch.sizeBytes;
-      if (patch.fileHash !== undefined) updatePayload.file_hash = patch.fileHash;
-      if (patch.storagePath !== undefined) updatePayload.storage_path = patch.storagePath;
-      if (patch.uploadedBy !== undefined) updatePayload.uploaded_by = patch.uploadedBy;
-      if (patch.uploaderRole !== undefined) updatePayload.uploader_role = patch.uploaderRole;
-      if (patch.status !== undefined) updatePayload.status = patch.status;
-      if (patch.createdAt !== undefined) updatePayload.created_at = patch.createdAt;
-      if (patch.updatedAt !== undefined) updatePayload.updated_at = patch.updatedAt;
-      if (patch.parsedMdPath !== undefined) updatePayload.parsed_md_path = patch.parsedMdPath;
-      if (patch.parseMethod !== undefined) updatePayload.parse_method = patch.parseMethod;
-      if (patch.parsedCharCount !== undefined) updatePayload.parsed_char_count = patch.parsedCharCount;
-      if (patch.embeddingModel !== undefined) updatePayload.embedding_model = patch.embeddingModel;
-      if (patch.errorMessage !== undefined) updatePayload.error_message = patch.errorMessage;
-
-      const result = await client
-        .from('knowledge_documents')
-        .update(updatePayload)
-        .eq('id', documentId)
-        .select(selectColumns)
-        .single();
-
-      if (result.error) {
-        throw new Error(`Failed to update document: ${result.error.message}`);
-      }
-      return mapDocumentRow(result.data as unknown as Record<string, unknown>);
+      const storage = await getStorage();
+      return storage.updateKnowledgeDocument(documentId, patch);
     },
     async deleteDocument(documentId) {
-      const result = await client
-        .from('knowledge_documents')
-        .delete()
-        .eq('id', documentId);
-
-      if (result.error) {
-        throw new Error(`Failed to delete document: ${result.error.message}`);
-      }
+      const storage = await getStorage();
+      await storage.deleteKnowledgeDocument(documentId);
     },
   };
 };
@@ -596,18 +482,11 @@ type CreateRagApiRouterOptions = {
 
 export const createRagApiRouter = (options: CreateRagApiRouterOptions = {}): Router => {
   const router = Router();
-  const repository = options.repository ?? buildSupabaseRepository();
+  const repository = options.repository ?? buildStorageRepository();
   const rootDir = options.rootDir || ROOT_DIR;
 
   router.get('/api/rag/documents', async (req, res) => {
     if (!requireAdminIdentity(req, res)) return;
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
 
     const items = await repository.listDocuments();
     res.status(200).json({
@@ -619,13 +498,6 @@ export const createRagApiRouter = (options: CreateRagApiRouterOptions = {}): Rou
   router.post('/api/rag/documents', async (req, res) => {
     const identity = requireAdminIdentity(req, res);
     if (!identity) return;
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
 
     try {
       const payload = await parseMultipartUpload(req);
@@ -692,13 +564,6 @@ export const createRagApiRouter = (options: CreateRagApiRouterOptions = {}): Rou
 
   router.get('/api/rag/documents/:document_id', async (req, res) => {
     if (!requireAdminIdentity(req, res)) return;
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
 
     const document = await loadDocumentOr404(repository, req, res);
     if (!document) return;
@@ -707,13 +572,6 @@ export const createRagApiRouter = (options: CreateRagApiRouterOptions = {}): Rou
 
   router.delete('/api/rag/documents/:document_id', async (req, res) => {
     if (!requireAdminIdentity(req, res)) return;
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
 
     const document = await loadDocumentOr404(repository, req, res);
     if (!document) return;
@@ -734,13 +592,6 @@ export const createRagApiRouter = (options: CreateRagApiRouterOptions = {}): Rou
 
   router.post('/api/rag/documents/:document_id/reindex', async (req, res) => {
     if (!requireAdminIdentity(req, res)) return;
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
 
     const document = await loadDocumentOr404(repository, req, res);
     if (!document) return;
@@ -806,46 +657,18 @@ export const createRagApiRouter = (options: CreateRagApiRouterOptions = {}): Rou
   };
 
   router.get('/api/rag/documents/:document_id/file', async (req, res) => {
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
     await sendDocumentFile(repository, req, res, 'documents');
   });
 
   router.get('/api/rag/documents/:document_id/preview', async (req, res) => {
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
     await sendDocumentPreview(repository, req, res, 'documents');
   });
 
   router.get('/api/rag/sources/:document_id/file', async (req, res) => {
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
     await sendDocumentFile(repository, req, res, 'sources');
   });
 
   router.get('/api/rag/sources/:document_id/preview', async (req, res) => {
-    if (!repository) {
-      res.status(503).json({
-        error: 'rag_documents_unavailable',
-        message: 'Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.',
-      });
-      return;
-    }
     await sendDocumentPreview(repository, req, res, 'sources');
   });
 

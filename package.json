@@ -2,6 +2,7 @@
   "scripts": {
     "dev": "bun ./src",
     "start": "bun ./src",
+    "cli": "bun ./src/cli.ts",
     "sync:mohw": "bun scripts/sync-mohw-clarifications.ts"
   },
   "dependencies": {
