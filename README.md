@@ -205,6 +205,10 @@ Useful mounted directories:
 - `./knowledge_base`
 - `./users_images`
 
+For automated production deployment with GitHub Actions, GHCR, and a self-hosted runner, see:
+
+- `docs/deployment-self-hosted-ghcr.md`
+
 ## Integration with Supabase or Existing Projects
 
 Set:

@@ -1,0 +1,137 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'D:\services\healthy-diet-ai-agent' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.12
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run test suite
+        run: bun test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=main
+            type=sha,prefix=sha-
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record deployment image
+        id: image
+        shell: bash
+        run: echo "image_ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    runs-on:
+      - self-hosted
+      - windows
+    permissions:
+      contents: read
+      packages: read
+    environment:
+      name: production
+    steps:
+      - name: Prepare deployment directory
+        shell: pwsh
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:DEPLOY_PATH)) {
+            New-Item -ItemType Directory -Path $env:DEPLOY_PATH | Out-Null
+          }
+
+          if (-not (Test-Path -LiteralPath (Join-Path $env:DEPLOY_PATH '.git'))) {
+            git -c "http.extraheader=AUTHORIZATION: bearer ${{ secrets.GITHUB_TOKEN }}" clone $env:REPO_URL $env:DEPLOY_PATH
+          fi
+
+      - name: Sync repository into deployment directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C $env:DEPLOY_PATH -c "http.extraheader=AUTHORIZATION: bearer ${{ secrets.GITHUB_TOKEN }}" fetch origin main
+          git -C $env:DEPLOY_PATH checkout main
+          git -C $env:DEPLOY_PATH reset --hard origin/main
+
+      - name: Log in to GHCR
+        shell: pwsh
+        run: ${{ secrets.GITHUB_TOKEN }} | docker login ${{ env.REGISTRY }} -u "${{ github.actor }}" --password-stdin
+
+      - name: Verify production env file exists
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $envFile = Join-Path $env:DEPLOY_PATH '.env'
+          if (-not (Test-Path -LiteralPath $envFile)) {
+            Write-Error "Missing $envFile. Create it from .env.example on the host before deploying."
+          }
+
+      - name: Pull and restart the service
+        shell: pwsh
+        env:
+          IMAGE_NAME: ${{ needs.build.outputs.image_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $composeFile = Join-Path $env:DEPLOY_PATH 'compose.yml'
+          docker compose -f $composeFile --project-directory $env:DEPLOY_PATH pull
+          docker compose -f $composeFile --project-directory $env:DEPLOY_PATH up -d
+          docker image prune -f

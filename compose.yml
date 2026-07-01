@@ -1,8 +1,7 @@
 services:
   healthy-diet-ai-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${IMAGE_NAME:-ghcr.io/archie0732/healthy-diet-ai-agent:main}
+    pull_policy: always
     container_name: healthy-diet-ai-agent
     restart: unless-stopped
     env_file:
