@@ -10,6 +10,9 @@ package-lock.json
 README.md
 README_zh.md
 README_jp.md
+!README.md
+!README_zh.md
+!README_jp.md
 users_images/**
 knowledge_base/uploads/**
 knowledge_base/ingested_markdown/**
