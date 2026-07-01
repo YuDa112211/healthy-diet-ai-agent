@@ -9,6 +9,7 @@ RUN bun install --frozen-lockfile --production
 COPY src ./src
 COPY scripts ./scripts
 COPY agent_skills ./agent_skills
+COPY agent_config.json ./agent_config.json
 COPY knowledge_base ./knowledge_base
 COPY docs ./docs
 COPY AGENT.md ./AGENT.md
